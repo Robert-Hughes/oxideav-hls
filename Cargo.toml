@@ -11,5 +11,6 @@ description = "HLS VOD source driver for OxideAV"
 [dependencies]
 oxideav-core = { workspace = true }
 oxideav-http = { workspace = true }
+oxideav-mpegts = { workspace = true }
 m3u8-rs = "6.0.1"
 url = "2"

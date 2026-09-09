@@ -9,17 +9,21 @@
 //! * no encryption, byte ranges, init maps, discontinuities, or live reloads.
 //!
 //! `m3u8-rs` parses the playlists; `oxideav-http` performs every HTTP transfer.
-//! The segment resources are exposed as one seekable logical byte source so the
-//! existing OxideAV MPEG-TS demuxer needs no HLS-specific knowledge. Segment byte
-//! lengths are learned lazily as playback reaches them so multi-hour VODs do not
-//! require thousands of HTTP metadata requests before the first frame.
+//! The source exposes already-demuxed packets while internally owning one
+//! MPEG-TS demuxer for the active media segment. `#EXTINF` durations provide a
+//! media-time index, so seeking jumps directly to one segment instead of byte-
+//! bisecting a virtual concatenation of every object in a long VOD.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::collections::{HashSet, VecDeque};
+use std::io::{Read, Seek, SeekFrom};
 
 use m3u8_rs::{
     AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
 };
-use oxideav_core::{BytesSource, Error, Result, RuntimeContext};
+use oxideav_core::{
+    BytesSource, Demuxer, Error, NullCodecResolver, Packet, PacketSource, ReadSeek, Result,
+    RuntimeContext, StreamInfo,
+};
 use url::Url;
 
 const DEFAULT_MAX_HEIGHT: u64 = 720;
@@ -88,33 +92,18 @@ pub fn inspect_hls(uri: &str) -> Result<HlsPlaylistInfo> {
 }
 
 pub fn register(ctx: &mut RuntimeContext) {
-    ctx.sources.register_bytes("hls+http", open_hls);
-    ctx.sources.register_bytes("hls+https", open_hls);
+    ctx.sources.register_packets("hls+http", open_hls);
+    ctx.sources.register_packets("hls+https", open_hls);
 }
 
 oxideav_core::register!("source", register);
 
-pub fn open_hls(uri: &str) -> Result<Box<dyn BytesSource>> {
+pub fn open_hls(uri: &str) -> Result<Box<dyn PacketSource>> {
     let playlist_url = unwrap_hls_uri(uri)?;
     let (media_url, media) = resolve_media_playlist(&playlist_url)?;
     validate_media_playlist(&media)?;
-
-    let mut segment_urls = Vec::with_capacity(media.segments.len());
-    for (idx, segment) in media.segments.iter().enumerate() {
-        validate_segment(idx, segment)?;
-        let segment_url = media_url.join(&segment.uri).map_err(|e| {
-            Error::invalid(format!("hls: invalid segment URI {:?}: {e}", segment.uri))
-        })?;
-        require_http(&segment_url, "segment")?;
-        segment_urls.push(segment_url);
-    }
-
-    eprintln!(
-        "oxideav-hls: VOD ready: {} segments (lazy HTTP segment indexing)",
-        segment_urls.len()
-    );
-
-    Ok(Box::new(HlsSource::new(segment_urls)))
+    HlsPacketSource::open(&media_url, &media)
+        .map(|source| Box::new(source) as Box<dyn PacketSource>)
 }
 
 fn unwrap_hls_uri(uri: &str) -> Result<Url> {
@@ -324,161 +313,298 @@ fn require_http(url: &Url, what: &str) -> Result<()> {
     }
 }
 
-struct HlsSource {
-    /// Resolved segment URLs in playlist order. No segment HTTP source is
-    /// opened merely by constructing the HLS source.
-    segment_urls: Vec<Url>,
-    /// Prefix byte offsets for segments whose lengths have been learned.
-    /// `starts[0] == 0`; when `starts.len() == N + 1`, segment N-1 is the
-    /// last indexed segment and `starts[N]` is the known-prefix byte length.
-    starts: Vec<u64>,
-    /// One live HTTP source, normally the segment currently being read.
-    /// Keeping only one avoids thousands of idle HTTP-source objects on long
-    /// Twitch VODs while still allowing an indexed segment to be reopened for
-    /// a backward seek.
-    current: Option<(usize, Box<dyn BytesSource>)>,
-    /// Absolute byte position in the virtual concatenated MPEG-TS stream.
-    pos: u64,
+#[derive(Clone, Debug)]
+struct SegmentEntry {
+    url: Url,
+    start_seconds: f64,
+    duration_seconds: f64,
 }
 
-impl HlsSource {
-    fn new(segment_urls: Vec<Url>) -> Self {
-        Self {
-            segment_urls,
-            starts: vec![0],
-            current: None,
-            pos: 0,
+/// `Box<dyn BytesSource>` cannot be directly coerced to `Box<dyn ReadSeek>`
+/// even though both trait bundles are `Read + Seek + Send`. This tiny shim
+/// bridges the two public OxideAV abstractions without copying segment bytes.
+struct SegmentReader(Box<dyn BytesSource>);
+
+impl Read for SegmentReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Seek for SegmentReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+struct HlsPacketSource {
+    segments: Vec<SegmentEntry>,
+    total_duration_seconds: f64,
+    streams: Vec<StreamInfo>,
+    transport_origin_seconds: f64,
+    current_segment: usize,
+    current: Box<dyn Demuxer>,
+    pending: VecDeque<Packet>,
+}
+
+impl HlsPacketSource {
+    fn open(media_url: &Url, media: &MediaPlaylist) -> Result<Self> {
+        let segments = build_segment_index(media_url, media)?;
+        let total_duration_seconds = segments
+            .last()
+            .map(|segment| segment.start_seconds + segment.duration_seconds)
+            .unwrap_or(0.0);
+        let mut current = open_segment_demuxer(&segments[0].url)?;
+
+        // MPEG-TS learns each stream's first PTS only as PES packets flow. Cache
+        // a small initial prefix so the PacketSource can advertise trustworthy
+        // start times before the pipeline snapshots StreamInfo, then replay that
+        // prefix unchanged through next_packet().
+        let stream_count = current.streams().len();
+        let mut pending = VecDeque::new();
+        let mut seen_timestamped = HashSet::new();
+        const INITIAL_TIMESTAMP_PACKETS_MAX: usize = 256;
+        while seen_timestamped.len() < stream_count && pending.len() < INITIAL_TIMESTAMP_PACKETS_MAX
+        {
+            match current.next_packet() {
+                Ok(packet) => {
+                    if packet.pts.is_some() {
+                        seen_timestamped.insert(packet.stream_index);
+                    }
+                    pending.push_back(packet);
+                }
+                Err(Error::Eof) => break,
+                Err(error) => return Err(error),
+            }
         }
-    }
 
-    fn indexed_count(&self) -> usize {
-        self.starts.len() - 1
-    }
+        let mut streams = current.streams().to_vec();
+        let transport_origin_seconds = streams
+            .iter()
+            .filter_map(|stream| {
+                stream
+                    .start_time
+                    .map(|pts| stream.time_base.seconds_of(pts))
+            })
+            .filter(|seconds| seconds.is_finite())
+            .min_by(f64::total_cmp)
+            .or_else(|| {
+                pending
+                    .iter()
+                    .filter_map(|packet| packet.pts.map(|pts| packet.time_base.seconds_of(pts)))
+                    .filter(|seconds| seconds.is_finite())
+                    .min_by(f64::total_cmp)
+            })
+            .ok_or_else(|| {
+                Error::invalid("hls: first MPEG-TS segment exposed no timestamped packets")
+            })?;
 
-    fn known_end(&self) -> u64 {
-        *self.starts.last().expect("HLS starts always contains zero")
-    }
-
-    fn fully_indexed(&self) -> bool {
-        self.indexed_count() == self.segment_urls.len()
-    }
-
-    fn segment_for_known_pos(&self, pos: u64) -> Option<usize> {
-        if pos >= self.known_end() {
-            return None;
+        for stream in &mut streams {
+            let tick_seconds = stream.time_base.as_rational().as_f64();
+            if tick_seconds.is_finite() && tick_seconds > 0.0 {
+                stream.duration = Some((total_duration_seconds / tick_seconds).round() as i64);
+            }
         }
-        (0..self.indexed_count()).find(|&i| pos >= self.starts[i] && pos < self.starts[i + 1])
+
+        eprintln!(
+            "oxideav-hls: VOD ready: {} segments duration={:.3}s transport_origin={:.3}s",
+            segments.len(),
+            total_duration_seconds,
+            transport_origin_seconds,
+        );
+
+        Ok(Self {
+            segments,
+            total_duration_seconds,
+            streams,
+            transport_origin_seconds,
+            current_segment: 0,
+            current,
+            pending,
+        })
     }
 
-    fn open_segment(&self, idx: usize) -> io::Result<Box<dyn BytesSource>> {
-        oxideav_http::open_http(self.segment_urls[idx].as_str()).map_err(io::Error::other)
+    fn open_segment(&self, index: usize) -> Result<Box<dyn Demuxer>> {
+        open_segment_demuxer(&self.segments[index].url)
     }
 
-    /// Learn one more segment's byte length. The returned source is rewound
-    /// and can be retained by the caller when this is the segment it wants to
-    /// read, avoiding a second HEAD/open operation.
-    fn index_next(&mut self) -> io::Result<(usize, Box<dyn BytesSource>)> {
-        let idx = self.indexed_count();
-        if idx >= self.segment_urls.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "hls: no segment left to index",
-            ));
+    fn install_segment(&mut self, index: usize, demuxer: Box<dyn Demuxer>) -> Result<()> {
+        validate_stream_layout(&self.streams, demuxer.streams(), index)?;
+        self.current_segment = index;
+        self.current = demuxer;
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn segment_for_media_seconds(&self, seconds: f64) -> usize {
+        segment_index_for_media_seconds(&self.segments, seconds)
+    }
+
+    fn seek_in_segment(
+        &self,
+        index: usize,
+        stream_index: u32,
+        pts: i64,
+    ) -> Result<(Box<dyn Demuxer>, i64)> {
+        let mut demuxer = self.open_segment(index)?;
+        validate_stream_layout(&self.streams, demuxer.streams(), index)?;
+        let landed = demuxer.seek_to(stream_index, pts)?;
+        Ok((demuxer, landed))
+    }
+}
+
+impl PacketSource for HlsPacketSource {
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        if let Some(packet) = self.pending.pop_front() {
+            return Ok(packet);
         }
-        let mut source = self.open_segment(idx)?;
-        let len = source.seek(SeekFrom::End(0))?;
-        source.seek(SeekFrom::Start(0))?;
-        let end = self.known_end().checked_add(len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "hls: concatenated segment length overflows u64",
-            )
-        })?;
-        self.starts.push(end);
-        Ok((idx, source))
-    }
-
-    /// Ensure the segment containing `self.pos` has a known byte range and a
-    /// live HTTP source. Seeking far forward can therefore index intervening
-    /// segments on demand, while normal sequential playback indexes exactly
-    /// one new segment at each boundary.
-    fn ensure_current_for_pos(&mut self) -> io::Result<Option<usize>> {
         loop {
-            if let Some(idx) = self.segment_for_known_pos(self.pos) {
-                if self.current.as_ref().map(|(i, _)| *i) != Some(idx) {
-                    let source = self.open_segment(idx)?;
-                    self.current = Some((idx, source));
+            match self.current.next_packet() {
+                Ok(packet) => return Ok(packet),
+                Err(Error::Eof) => {
+                    let next = self.current_segment + 1;
+                    if next >= self.segments.len() {
+                        return Err(Error::Eof);
+                    }
+                    let demuxer = self.open_segment(next)?;
+                    self.install_segment(next, demuxer)?;
                 }
-                return Ok(Some(idx));
+                Err(error) => return Err(error),
             }
-
-            if self.fully_indexed() {
-                return Ok(None);
-            }
-
-            let (idx, source) = self.index_next()?;
-            let seg_end = self.starts[idx + 1];
-            if self.pos < seg_end {
-                self.current = Some((idx, source));
-                return Ok(Some(idx));
-            }
-            // Zero-length segment, or a forward seek beyond this newly
-            // indexed segment: discard its source and continue indexing.
         }
     }
-}
 
-impl Read for HlsSource {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let requested_stream = self
+            .streams
+            .iter()
+            .find(|stream| stream.index == stream_index)
+            .ok_or_else(|| Error::invalid(format!("hls: no stream with index {stream_index}")))?;
+        let time_base = requested_stream.time_base;
+        // For A/V HLS, landing must be video-decode-safe even when the
+        // application addressed the audio route (sink-facing and source stream
+        // indices need not have the same ordering). MPEG-TS uses the same
+        // 90 kHz time base for every elementary stream, so the target PTS is
+        // unchanged when we prefer the first video stream for access-point
+        // selection. Audio-only renditions keep the requested stream.
+        let seek_stream_index = self
+            .streams
+            .iter()
+            .find(|stream| stream.params.media_type == oxideav_core::MediaType::Video)
+            .map(|stream| stream.index)
+            .unwrap_or(stream_index);
+        let raw_seconds = time_base.seconds_of(pts);
+        if !raw_seconds.is_finite() {
+            return Err(Error::invalid("hls: seek target is not a finite timestamp"));
         }
-        let Some(idx) = self.ensure_current_for_pos()? else {
-            return Ok(0);
-        };
+        let media_seconds = (raw_seconds - self.transport_origin_seconds)
+            .clamp(0.0, self.total_duration_seconds.max(0.0));
+        let index = self.segment_for_media_seconds(media_seconds);
 
-        let segment_start = self.starts[idx];
-        let segment_end = self.starts[idx + 1];
-        let intra = self.pos - segment_start;
-        let want = buf.len().min((segment_end - self.pos) as usize);
-        let (_, part) = self
-            .current
-            .as_mut()
-            .expect("ensure_current_for_pos installed source");
-        part.seek(SeekFrom::Start(intra))?;
-        let n = part.read(&mut buf[..want])?;
-        self.pos += n as u64;
-        Ok(n)
+        eprintln!(
+            "oxideav-hls: seek target_raw={raw_seconds:.3}s media={media_seconds:.3}s segment={index} segment_start={:.3}s",
+            self.segments[index].start_seconds,
+        );
+
+        let (mut demuxer, mut landed) = self.seek_in_segment(index, seek_stream_index, pts)?;
+        let mut landed_index = index;
+
+        // EXTINF timing is nominal and can differ by a few ticks from the TS
+        // access-point timeline. If the selected segment can only clamp upward
+        // past the requested PTS, seek the preceding segment instead so the
+        // public "nearest decode-safe point at or before target" contract holds.
+        if landed > pts && index > 0 {
+            let previous = index - 1;
+            let result = self.seek_in_segment(previous, seek_stream_index, pts)?;
+            demuxer = result.0;
+            landed = result.1;
+            landed_index = previous;
+        }
+
+        self.install_segment(landed_index, demuxer)?;
+        eprintln!(
+            "oxideav-hls: seek landed segment={} raw={:.3}s media={:.3}s",
+            landed_index,
+            time_base.seconds_of(landed),
+            time_base.seconds_of(landed) - self.transport_origin_seconds,
+        );
+        Ok(landed)
+    }
+
+    fn duration_micros(&self) -> Option<i64> {
+        Some((self.total_duration_seconds * 1_000_000.0).round() as i64)
     }
 }
 
-impl Seek for HlsSource {
-    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        let target = match from {
-            SeekFrom::Start(n) => n,
-            SeekFrom::Current(delta) => add_signed(self.pos, delta)?,
-            SeekFrom::End(delta) => {
-                if !self.fully_indexed() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "hls: end-relative seek requires all segment lengths; VOD is lazily indexed",
-                    ));
-                }
-                add_signed(self.known_end(), delta)?
-            }
-        };
-        self.pos = target;
-        Ok(target)
+fn build_segment_index(media_url: &Url, media: &MediaPlaylist) -> Result<Vec<SegmentEntry>> {
+    let mut segments = Vec::with_capacity(media.segments.len());
+    let mut start_seconds = 0.0_f64;
+    for (index, segment) in media.segments.iter().enumerate() {
+        validate_segment(index, segment)?;
+        let url = media_url.join(&segment.uri).map_err(|error| {
+            Error::invalid(format!(
+                "hls: invalid segment URI {:?}: {error}",
+                segment.uri
+            ))
+        })?;
+        require_http(&url, "segment")?;
+        let duration_seconds = f64::from(segment.duration);
+        if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+            return Err(Error::invalid(format!(
+                "hls: segment {index} has invalid EXTINF duration {}",
+                segment.duration
+            )));
+        }
+        segments.push(SegmentEntry {
+            url,
+            start_seconds,
+            duration_seconds,
+        });
+        start_seconds += duration_seconds;
     }
+    Ok(segments)
 }
 
-fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
-    base.checked_add_signed(delta).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "hls: seek resolves before byte zero or overflows",
-        )
-    })
+fn segment_index_for_media_seconds(segments: &[SegmentEntry], seconds: f64) -> usize {
+    debug_assert!(!segments.is_empty());
+    let seconds = seconds.max(0.0);
+    let insertion = segments.partition_point(|segment| segment.start_seconds <= seconds);
+    insertion.saturating_sub(1).min(segments.len() - 1)
+}
+
+fn open_segment_demuxer(url: &Url) -> Result<Box<dyn Demuxer>> {
+    let bytes = oxideav_http::open_http(url.as_str())?;
+    let input: Box<dyn ReadSeek> = Box::new(SegmentReader(bytes));
+    oxideav_mpegts::open_demuxer(input, &NullCodecResolver)
+}
+
+fn validate_stream_layout(
+    expected: &[StreamInfo],
+    actual: &[StreamInfo],
+    segment: usize,
+) -> Result<()> {
+    if expected.len() != actual.len() {
+        return Err(Error::invalid(format!(
+            "hls: MPEG-TS stream count changed at segment {segment}: expected {}, got {}",
+            expected.len(),
+            actual.len()
+        )));
+    }
+    for (expected, actual) in expected.iter().zip(actual) {
+        if expected.index != actual.index
+            || expected.params.media_type != actual.params.media_type
+            || expected.params.codec_id != actual.params.codec_id
+        {
+            return Err(Error::invalid(format!(
+                "hls: MPEG-TS stream layout changed at segment {segment}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,16 +725,39 @@ mod tests {
     }
 
     #[test]
-    fn lazy_source_rejects_end_seek_before_segment_lengths_are_known() {
-        let urls = vec![
-            Url::parse("https://example.test/0.ts").unwrap(),
-            Url::parse("https://example.test/1.ts").unwrap(),
-        ];
-        let mut src = HlsSource::new(urls);
-        assert_eq!(src.seek(SeekFrom::Start(123)).unwrap(), 123);
-        assert_eq!(src.seek(SeekFrom::Current(-23)).unwrap(), 100);
-        let err = src.seek(SeekFrom::End(0)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    fn extinf_index_maps_media_time_without_segment_byte_lengths() {
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let media = MediaPlaylist {
+            end_list: true,
+            segments: vec![
+                m3u8_rs::MediaSegment {
+                    uri: "0.ts".into(),
+                    duration: 10.0,
+                    ..Default::default()
+                },
+                m3u8_rs::MediaSegment {
+                    uri: "1.ts".into(),
+                    duration: 10.5,
+                    ..Default::default()
+                },
+                m3u8_rs::MediaSegment {
+                    uri: "2.ts".into(),
+                    duration: 9.5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let segments = build_segment_index(&media_url, &media).unwrap();
+        assert_eq!(segments[0].start_seconds, 0.0);
+        assert_eq!(segments[1].start_seconds, 10.0);
+        assert_eq!(segments[2].start_seconds, 20.5);
+        assert_eq!(segment_index_for_media_seconds(&segments, 0.0), 0);
+        assert_eq!(segment_index_for_media_seconds(&segments, 9.999), 0);
+        assert_eq!(segment_index_for_media_seconds(&segments, 10.0), 1);
+        assert_eq!(segment_index_for_media_seconds(&segments, 20.49), 1);
+        assert_eq!(segment_index_for_media_seconds(&segments, 29.9), 2);
+        assert_eq!(segments[2].url.as_str(), "https://example.test/vod/2.ts");
     }
 
     #[test]
