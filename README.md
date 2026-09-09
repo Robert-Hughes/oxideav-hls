@@ -48,6 +48,15 @@ integer to change that ceiling. If the master contains no usable rendition at
 or below the ceiling, the lowest-bandwidth playable rendition is used as a
 conservative fallback.
 
+Applications that want to present their own fixed-rendition selector can call
+`inspect_hls()` first. A master inspection performs one bounded GET and returns
+each non-I-frame variant with its absolute media-playlist URL, bandwidth,
+resolution, frame rate, codecs and linked rendition name/group metadata, plus
+the index that `open_hls()` would have chosen automatically. Opening one of the
+returned media URLs then fetches that media playlist directly; it does not fetch
+the master a second time. `inspect_hls()` does not open any media playlist or
+segment itself.
+
 This is fixed-rendition selection, not ABR. A future adaptive controller should
 be a separate policy layer rather than hidden inside the byte-source reader.
 

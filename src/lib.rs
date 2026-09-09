@@ -16,12 +16,76 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use m3u8_rs::{KeyMethod, MediaPlaylist, Playlist, VariantStream};
+use m3u8_rs::{
+    AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
+};
 use oxideav_core::{BytesSource, Error, Result, RuntimeContext};
 use url::Url;
 
 const DEFAULT_MAX_HEIGHT: u64 = 720;
 const MAX_PLAYLIST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// One non-I-frame rendition advertised by an HLS master playlist.
+///
+/// `url` is already resolved against the master URL, so callers that choose a
+/// fixed rendition can pass it straight back to the HLS source without
+/// fetching the master again. The remaining fields mirror useful
+/// `#EXT-X-STREAM-INF` metadata while keeping `m3u8-rs` types out of the public
+/// OxideAV API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HlsVariant {
+    pub url: Url,
+    pub bandwidth: u64,
+    pub average_bandwidth: Option<u64>,
+    pub width: Option<u64>,
+    pub height: Option<u64>,
+    pub frame_rate: Option<f64>,
+    pub codecs: Option<String>,
+    pub video_group: Option<String>,
+    pub audio_group: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Result of fetching and parsing one HLS playlist for discovery.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HlsPlaylistInfo {
+    /// The supplied URL was already a media playlist.
+    Media { url: Url },
+    /// The supplied URL was a master playlist. `preferred_variant` is the
+    /// rendition selected by the same fixed-rendition policy used by
+    /// [`open_hls`] when it is handed the master directly.
+    Master {
+        variants: Vec<HlsVariant>,
+        preferred_variant: usize,
+    },
+}
+
+/// Fetch and inspect an HLS master/media playlist without opening any media
+/// rendition or segment.
+///
+/// For a master this performs exactly one bounded GET of the master playlist.
+/// Returned variant URLs are absolute, allowing a consumer to choose one and
+/// subsequently open that media playlist directly.
+pub fn inspect_hls(uri: &str) -> Result<HlsPlaylistInfo> {
+    let playlist_url = unwrap_hls_uri(uri)?;
+    match fetch_playlist(&playlist_url)? {
+        Playlist::MediaPlaylist(_) => {
+            eprintln!("oxideav-hls: inspected media playlist: {playlist_url}");
+            Ok(HlsPlaylistInfo::Media { url: playlist_url })
+        }
+        Playlist::MasterPlaylist(master) => {
+            eprintln!(
+                "oxideav-hls: inspected master playlist: {} variants: {playlist_url}",
+                master
+                    .variants
+                    .iter()
+                    .filter(|variant| !variant.is_i_frame)
+                    .count()
+            );
+            inspect_master(&playlist_url, &master)
+        }
+    }
+}
 
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.sources.register_bytes("hls+http", open_hls);
@@ -77,6 +141,67 @@ fn fetch_playlist(url: &Url) -> Result<Playlist> {
     let (_, playlist) = m3u8_rs::parse_playlist(&bytes)
         .map_err(|e| Error::invalid(format!("hls: failed to parse playlist {url}: {e:?}")))?;
     Ok(playlist)
+}
+
+fn inspect_master(master_url: &Url, master: &MasterPlaylist) -> Result<HlsPlaylistInfo> {
+    let preferred_uri = select_variant(&master.variants)?.uri.clone();
+    let preferred_url = master_url.join(&preferred_uri).map_err(|error| {
+        Error::invalid(format!(
+            "hls: invalid preferred variant URI {preferred_uri:?}: {error}"
+        ))
+    })?;
+    let variants = inspect_variants(master_url, master)?;
+    let preferred_variant = variants
+        .iter()
+        .position(|variant| variant.url == preferred_url)
+        .ok_or_else(|| {
+            Error::invalid("hls: preferred variant was not present in inspected master")
+        })?;
+    Ok(HlsPlaylistInfo::Master {
+        variants,
+        preferred_variant,
+    })
+}
+
+fn inspect_variants(master_url: &Url, master: &MasterPlaylist) -> Result<Vec<HlsVariant>> {
+    let mut variants = Vec::new();
+    for variant in master.variants.iter().filter(|variant| !variant.is_i_frame) {
+        let url = master_url.join(&variant.uri).map_err(|error| {
+            Error::invalid(format!(
+                "hls: invalid variant URI {:?}: {error}",
+                variant.uri
+            ))
+        })?;
+        require_http(&url, "variant playlist")?;
+        let name = variant.video.as_deref().and_then(|group_id| {
+            master
+                .alternatives
+                .iter()
+                .find(|alternative| {
+                    alternative.media_type == AlternativeMediaType::Video
+                        && alternative.group_id == group_id
+                })
+                .map(|alternative| alternative.name.clone())
+        });
+        variants.push(HlsVariant {
+            url,
+            bandwidth: variant.bandwidth,
+            average_bandwidth: variant.average_bandwidth,
+            width: variant.resolution.map(|resolution| resolution.width),
+            height: variant.resolution.map(|resolution| resolution.height),
+            frame_rate: variant.frame_rate,
+            codecs: variant.codecs.clone(),
+            video_group: variant.video.clone(),
+            audio_group: variant.audio.clone(),
+            name,
+        });
+    }
+    if variants.is_empty() {
+        return Err(Error::invalid(
+            "hls: master playlist has no playable variants",
+        ));
+    }
+    Ok(variants)
 }
 
 fn resolve_media_playlist(initial_url: &Url) -> Result<(Url, MediaPlaylist)> {
@@ -359,7 +484,7 @@ fn add_signed(base: u64, delta: i64) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use m3u8_rs::{MasterPlaylist, Resolution};
+    use m3u8_rs::{AlternativeMedia, MasterPlaylist, Resolution};
 
     #[test]
     fn selects_highest_variant_at_or_below_default_height() {
@@ -398,6 +523,79 @@ mod tests {
         };
         std::env::remove_var("OXIDEAV_HLS_MAX_HEIGHT");
         assert_eq!(select_variant(&master.variants).unwrap().uri, "720.m3u8");
+    }
+
+    #[test]
+    fn inspection_resolves_variant_urls_names_and_preferred_rendition() {
+        let master_url = Url::parse("https://example.test/path/master.m3u8").unwrap();
+        let master = MasterPlaylist {
+            variants: vec![
+                VariantStream {
+                    uri: "1080.m3u8".into(),
+                    bandwidth: 5_000_000,
+                    codecs: Some("avc1.64002a,mp4a.40.2".into()),
+                    resolution: Some(Resolution {
+                        width: 1920,
+                        height: 1080,
+                    }),
+                    frame_rate: Some(60.0),
+                    video: Some("source".into()),
+                    ..Default::default()
+                },
+                VariantStream {
+                    uri: "720.m3u8".into(),
+                    bandwidth: 3_000_000,
+                    resolution: Some(Resolution {
+                        width: 1280,
+                        height: 720,
+                    }),
+                    frame_rate: Some(60.0),
+                    video: Some("720p60".into()),
+                    ..Default::default()
+                },
+                VariantStream {
+                    uri: "iframe.m3u8".into(),
+                    bandwidth: 500_000,
+                    is_i_frame: true,
+                    ..Default::default()
+                },
+            ],
+            alternatives: vec![
+                AlternativeMedia {
+                    media_type: AlternativeMediaType::Video,
+                    group_id: "source".into(),
+                    name: "1080p60".into(),
+                    ..Default::default()
+                },
+                AlternativeMedia {
+                    media_type: AlternativeMediaType::Video,
+                    group_id: "720p60".into(),
+                    name: "720p60".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let HlsPlaylistInfo::Master {
+            variants,
+            preferred_variant,
+        } = inspect_master(&master_url, &master).unwrap()
+        else {
+            panic!("expected master inspection");
+        };
+
+        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            variants[0].url.as_str(),
+            "https://example.test/path/1080.m3u8"
+        );
+        assert_eq!(variants[0].name.as_deref(), Some("1080p60"));
+        assert_eq!(variants[0].width, Some(1920));
+        assert_eq!(variants[0].height, Some(1080));
+        assert_eq!(variants[0].frame_rate, Some(60.0));
+        assert_eq!(variants[0].bandwidth, 5_000_000);
+        assert_eq!(preferred_variant, 1);
     }
 
     #[test]
