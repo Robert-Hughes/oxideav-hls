@@ -9,13 +9,17 @@
 //! * no encryption, byte ranges, init maps, discontinuities, or live reloads.
 //!
 //! `m3u8-rs` parses the playlists; `oxideav-http` performs every HTTP transfer.
-//! The source exposes already-demuxed packets while internally owning one
-//! MPEG-TS demuxer for the active media segment. `#EXTINF` durations provide a
-//! media-time index, so seeking jumps directly to one segment instead of byte-
+//! The source exposes already-demuxed packets while owning the active MPEG-TS
+//! demuxer plus one HLS-local successor readahead. The successor is opened on a
+//! background thread and primed through its first packet so HTTP setup and initial
+//! demux work overlap playback of the current segment. `#EXTINF` durations provide
+//! a media-time index, so seeking jumps directly to one segment instead of byte-
 //! bisecting a virtual concatenation of every object in a long VOD.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::{mpsc, Arc};
+use std::thread;
 
 use m3u8_rs::{
     AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
@@ -337,6 +341,19 @@ impl Seek for SegmentReader {
     }
 }
 
+type SegmentOpener = Arc<dyn Fn(&Url) -> Result<Box<dyn Demuxer>> + Send + Sync + 'static>;
+
+struct PreparedSegment {
+    index: usize,
+    demuxer: Box<dyn Demuxer>,
+    first_packet: Option<Packet>,
+}
+
+struct SegmentReadahead {
+    index: usize,
+    receiver: mpsc::Receiver<Result<PreparedSegment>>,
+}
+
 struct HlsPacketSource {
     segments: Vec<SegmentEntry>,
     total_duration_seconds: f64,
@@ -345,16 +362,26 @@ struct HlsPacketSource {
     current_segment: usize,
     current: Box<dyn Demuxer>,
     pending: VecDeque<Packet>,
+    segment_opener: SegmentOpener,
+    readahead: Option<SegmentReadahead>,
 }
 
 impl HlsPacketSource {
     fn open(media_url: &Url, media: &MediaPlaylist) -> Result<Self> {
+        Self::open_with_opener(media_url, media, Arc::new(open_segment_demuxer))
+    }
+
+    fn open_with_opener(
+        media_url: &Url,
+        media: &MediaPlaylist,
+        segment_opener: SegmentOpener,
+    ) -> Result<Self> {
         let segments = build_segment_index(media_url, media)?;
         let total_duration_seconds = segments
             .last()
             .map(|segment| segment.start_seconds + segment.duration_seconds)
             .unwrap_or(0.0);
-        let mut current = open_segment_demuxer(&segments[0].url)?;
+        let mut current = segment_opener(&segments[0].url)?;
 
         // MPEG-TS learns each stream's first PTS only as PES packets flow. Cache
         // a small initial prefix so the PacketSource can advertise trustworthy
@@ -413,7 +440,7 @@ impl HlsPacketSource {
             transport_origin_seconds,
         );
 
-        Ok(Self {
+        let mut source = Self {
             segments,
             total_duration_seconds,
             streams,
@@ -421,11 +448,64 @@ impl HlsPacketSource {
             current_segment: 0,
             current,
             pending,
-        })
+            segment_opener,
+            readahead: None,
+        };
+        source.start_readahead();
+        Ok(source)
     }
 
     fn open_segment(&self, index: usize) -> Result<Box<dyn Demuxer>> {
-        open_segment_demuxer(&self.segments[index].url)
+        (self.segment_opener)(&self.segments[index].url)
+    }
+
+    fn start_readahead(&mut self) {
+        self.readahead = None;
+        let index = self.current_segment + 1;
+        if index >= self.segments.len() {
+            return;
+        }
+
+        let url = self.segments[index].url.clone();
+        let expected_streams = self.streams.clone();
+        let opener = Arc::clone(&self.segment_opener);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name(format!("oxideav-hls-readahead-{index}"))
+            .spawn(move || {
+                let result = prepare_segment(index, url, expected_streams, opener);
+                let _ = sender.send(result);
+            });
+
+        match worker {
+            Ok(_) => {
+                self.readahead = Some(SegmentReadahead { index, receiver });
+            }
+            Err(error) => {
+                eprintln!(
+                    "oxideav-hls: could not start segment {index} readahead worker: {error}; falling back to synchronous open"
+                );
+            }
+        }
+    }
+
+    fn take_prepared_segment(&mut self, index: usize) -> Result<PreparedSegment> {
+        if let Some(readahead) = self.readahead.take() {
+            if readahead.index == index {
+                return readahead.receiver.recv().map_err(|error| {
+                    Error::other(format!(
+                        "hls: segment {index} readahead worker ended without a result: {error}"
+                    ))
+                })?;
+            }
+        }
+
+        prepare_segment(
+            index,
+            self.segments[index].url.clone(),
+            self.streams.clone(),
+            Arc::clone(&self.segment_opener),
+        )
     }
 
     fn install_segment(&mut self, index: usize, demuxer: Box<dyn Demuxer>) -> Result<()> {
@@ -433,6 +513,16 @@ impl HlsPacketSource {
         self.current_segment = index;
         self.current = demuxer;
         self.pending.clear();
+        self.start_readahead();
+        Ok(())
+    }
+
+    fn install_prepared_segment(&mut self, prepared: PreparedSegment) -> Result<()> {
+        let index = prepared.index;
+        self.install_segment(index, prepared.demuxer)?;
+        if let Some(packet) = prepared.first_packet {
+            self.pending.push_back(packet);
+        }
         Ok(())
     }
 
@@ -453,16 +543,36 @@ impl HlsPacketSource {
     }
 }
 
+fn prepare_segment(
+    index: usize,
+    url: Url,
+    expected_streams: Vec<StreamInfo>,
+    opener: SegmentOpener,
+) -> Result<PreparedSegment> {
+    let mut demuxer = opener(&url)?;
+    let first_packet = match demuxer.next_packet() {
+        Ok(packet) => Some(packet),
+        Err(Error::Eof) => None,
+        Err(error) => return Err(error),
+    };
+    validate_stream_layout(&expected_streams, demuxer.streams(), index)?;
+    Ok(PreparedSegment {
+        index,
+        demuxer,
+        first_packet,
+    })
+}
+
 impl PacketSource for HlsPacketSource {
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        if let Some(packet) = self.pending.pop_front() {
-            return Ok(packet);
-        }
         loop {
+            if let Some(packet) = self.pending.pop_front() {
+                return Ok(packet);
+            }
             match self.current.next_packet() {
                 Ok(packet) => return Ok(packet),
                 Err(Error::Eof) => {
@@ -470,8 +580,8 @@ impl PacketSource for HlsPacketSource {
                     if next >= self.segments.len() {
                         return Err(Error::Eof);
                     }
-                    let demuxer = self.open_segment(next)?;
-                    self.install_segment(next, demuxer)?;
+                    let prepared = self.take_prepared_segment(next)?;
+                    self.install_prepared_segment(prepared)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -611,6 +721,127 @@ fn validate_stream_layout(
 mod tests {
     use super::*;
     use m3u8_rs::{AlternativeMedia, MasterPlaylist, Resolution};
+    use oxideav_core::{CodecId, CodecParameters, MediaType, TimeBase};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct FakeDemuxer {
+        streams: Vec<StreamInfo>,
+        packets: VecDeque<Packet>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl FakeDemuxer {
+        fn new(segment: usize, reads: Arc<AtomicUsize>) -> Self {
+            let stream = fake_stream();
+            let base = segment as i64 * 10_000;
+            Self {
+                streams: vec![stream.clone()],
+                packets: VecDeque::from([
+                    Packet::new(0, stream.time_base, vec![segment as u8, 0]).with_pts(base),
+                    Packet::new(0, stream.time_base, vec![segment as u8, 1]).with_pts(base + 1_000),
+                ]),
+                reads,
+            }
+        }
+    }
+
+    impl Demuxer for FakeDemuxer {
+        fn format_name(&self) -> &str {
+            "fake-mpegts"
+        }
+
+        fn streams(&self) -> &[StreamInfo] {
+            &self.streams
+        }
+
+        fn next_packet(&mut self) -> Result<Packet> {
+            match self.packets.pop_front() {
+                Some(packet) => {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(packet)
+                }
+                None => Err(Error::Eof),
+            }
+        }
+
+        fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+            Ok(pts)
+        }
+    }
+
+    fn fake_stream() -> StreamInfo {
+        let mut params = CodecParameters::video(CodecId::new("h264"));
+        params.media_type = MediaType::Video;
+        StreamInfo {
+            index: 0,
+            time_base: TimeBase::new(1, 1_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        }
+    }
+
+    fn fake_media(segment_count: usize) -> MediaPlaylist {
+        MediaPlaylist {
+            end_list: true,
+            segments: (0..segment_count)
+                .map(|index| m3u8_rs::MediaSegment {
+                    uri: format!("{index}.ts"),
+                    duration: 10.0,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn segment_number(url: &Url) -> usize {
+        url.path_segments()
+            .and_then(|mut parts| parts.next_back())
+            .and_then(|name| name.strip_suffix(".ts"))
+            .and_then(|name| name.parse().ok())
+            .expect("test segment URL")
+    }
+
+    fn fake_opener(
+        open_counts: Arc<Vec<AtomicUsize>>,
+        read_counts: Arc<Vec<Arc<AtomicUsize>>>,
+        failing_segment: Option<usize>,
+    ) -> SegmentOpener {
+        Arc::new(move |url| {
+            let segment = segment_number(url);
+            open_counts[segment].fetch_add(1, Ordering::SeqCst);
+            if failing_segment == Some(segment) {
+                return Err(Error::other(format!(
+                    "synthetic segment {segment} open failure"
+                )));
+            }
+            Ok(Box::new(FakeDemuxer::new(
+                segment,
+                Arc::clone(&read_counts[segment]),
+            )))
+        })
+    }
+
+    fn counters(count: usize) -> Arc<Vec<AtomicUsize>> {
+        Arc::new((0..count).map(|_| AtomicUsize::new(0)).collect())
+    }
+
+    fn read_counters(count: usize) -> Arc<Vec<Arc<AtomicUsize>>> {
+        Arc::new((0..count).map(|_| Arc::new(AtomicUsize::new(0))).collect())
+    }
+
+    fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while counter.load(Ordering::SeqCst) < expected {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for background HLS readahead"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
     fn selects_highest_variant_at_or_below_default_height() {
@@ -768,5 +999,67 @@ mod tests {
                 .as_str(),
             "https://example.test/master.m3u8"
         );
+    }
+    #[test]
+    fn readahead_primes_successor_before_current_segment_eof() {
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let media = fake_media(3);
+        let open_counts = counters(3);
+        let read_counts = read_counters(3);
+        let opener = fake_opener(Arc::clone(&open_counts), Arc::clone(&read_counts), None);
+
+        let mut source = HlsPacketSource::open_with_opener(&media_url, &media, opener).unwrap();
+
+        wait_for_count(&read_counts[1], 1);
+        assert_eq!(open_counts[1].load(Ordering::SeqCst), 1);
+
+        assert_eq!(source.next_packet().unwrap().data, vec![0, 0]);
+        assert_eq!(source.next_packet().unwrap().data, vec![0, 1]);
+        assert_eq!(source.next_packet().unwrap().data, vec![1, 0]);
+        assert_eq!(
+            open_counts[1].load(Ordering::SeqCst),
+            1,
+            "segment 1 should be installed from readahead, not reopened at EOF"
+        );
+    }
+
+    #[test]
+    fn readahead_error_is_deferred_until_successor_is_needed() {
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let media = fake_media(2);
+        let open_counts = counters(2);
+        let read_counts = read_counters(2);
+        let opener = fake_opener(Arc::clone(&open_counts), Arc::clone(&read_counts), Some(1));
+
+        let mut source = HlsPacketSource::open_with_opener(&media_url, &media, opener).unwrap();
+
+        assert_eq!(source.next_packet().unwrap().data, vec![0, 0]);
+        assert_eq!(source.next_packet().unwrap().data, vec![0, 1]);
+
+        let error = source.next_packet().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic segment 1 open failure"),
+            "unexpected deferred readahead error: {error}"
+        );
+    }
+
+    #[test]
+    fn seek_replaces_readahead_with_landed_segments_successor() {
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let media = fake_media(4);
+        let open_counts = counters(4);
+        let read_counts = read_counters(4);
+        let opener = fake_opener(Arc::clone(&open_counts), Arc::clone(&read_counts), None);
+
+        let mut source = HlsPacketSource::open_with_opener(&media_url, &media, opener).unwrap();
+        wait_for_count(&read_counts[1], 1);
+
+        assert_eq!(source.seek_to(0, 25_000).unwrap(), 25_000);
+        assert_eq!(source.current_segment, 2);
+        assert_eq!(source.readahead.as_ref().map(|r| r.index), Some(3));
+        wait_for_count(&read_counts[3], 1);
+        assert_eq!(open_counts[3].load(Ordering::SeqCst), 1);
     }
 }
