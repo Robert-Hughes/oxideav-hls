@@ -78,11 +78,11 @@ pub fn inspect_hls(uri: &str) -> Result<HlsPlaylistInfo> {
     let playlist_url = unwrap_hls_uri(uri)?;
     match fetch_playlist(&playlist_url)? {
         Playlist::MediaPlaylist(_) => {
-            eprintln!("oxideav-hls: inspected media playlist: {playlist_url}");
+            log::info!("oxideav-hls: inspected media playlist: {playlist_url}");
             Ok(HlsPlaylistInfo::Media { url: playlist_url })
         }
         Playlist::MasterPlaylist(master) => {
-            eprintln!(
+            log::info!(
                 "oxideav-hls: inspected master playlist: {} variants: {playlist_url}",
                 master
                     .variants
@@ -200,7 +200,7 @@ fn inspect_variants(master_url: &Url, master: &MasterPlaylist) -> Result<Vec<Hls
 fn resolve_media_playlist(initial_url: &Url) -> Result<(Url, MediaPlaylist)> {
     match fetch_playlist(initial_url)? {
         Playlist::MediaPlaylist(media) => {
-            eprintln!("oxideav-hls: media playlist: {initial_url}");
+            log::info!("oxideav-hls: media playlist: {initial_url}");
             Ok((initial_url.clone(), media))
         }
         Playlist::MasterPlaylist(master) => {
@@ -213,7 +213,7 @@ fn resolve_media_playlist(initial_url: &Url) -> Result<(Url, MediaPlaylist)> {
                 .resolution
                 .map(|r| format!("{}x{}", r.width, r.height))
                 .unwrap_or_else(|| "unknown resolution".to_string());
-            eprintln!(
+            log::info!(
                 "oxideav-hls: selected variant {resolution}, bandwidth {}: {media_url}",
                 variant.bandwidth
             );
@@ -433,7 +433,7 @@ impl HlsPacketSource {
             }
         }
 
-        eprintln!(
+        log::info!(
             "oxideav-hls: VOD ready: {} segments duration={:.3}s transport_origin={:.3}s",
             segments.len(),
             total_duration_seconds,
@@ -482,7 +482,7 @@ impl HlsPacketSource {
                 self.readahead = Some(SegmentReadahead { index, receiver });
             }
             Err(error) => {
-                eprintln!(
+                log::warn!(
                     "oxideav-hls: could not start segment {index} readahead worker: {error}; falling back to synchronous open"
                 );
             }
@@ -615,7 +615,7 @@ impl PacketSource for HlsPacketSource {
             .clamp(0.0, self.total_duration_seconds.max(0.0));
         let index = self.segment_for_media_seconds(media_seconds);
 
-        eprintln!(
+        log::info!(
             "oxideav-hls: seek target_raw={raw_seconds:.3}s media={media_seconds:.3}s segment={index} segment_start={:.3}s",
             self.segments[index].start_seconds,
         );
@@ -636,7 +636,7 @@ impl PacketSource for HlsPacketSource {
         }
 
         self.install_segment(landed_index, demuxer)?;
-        eprintln!(
+        log::info!(
             "oxideav-hls: seek landed segment={} raw={:.3}s media={:.3}s",
             landed_index,
             time_base.seconds_of(landed),

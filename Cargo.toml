@@ -9,6 +9,7 @@ authors.workspace = true
 description = "HLS VOD source driver for OxideAV"
 
 [dependencies]
+log = "0.4"
 oxideav-core = { workspace = true }
 oxideav-http = { workspace = true }
 oxideav-mpegts = { workspace = true }
