@@ -346,6 +346,7 @@ type SegmentOpener = Arc<dyn Fn(&Url) -> Result<Box<dyn Demuxer>> + Send + Sync 
 struct PreparedSegment {
     index: usize,
     demuxer: Box<dyn Demuxer>,
+    stream_map: Vec<(u32, u32)>,
     first_packet: Option<Packet>,
 }
 
@@ -361,6 +362,7 @@ struct HlsPacketSource {
     transport_origin_seconds: f64,
     current_segment: usize,
     current: Box<dyn Demuxer>,
+    current_stream_map: Vec<(u32, u32)>,
     pending: VecDeque<Packet>,
     segment_opener: SegmentOpener,
     readahead: Option<SegmentReadahead>,
@@ -440,6 +442,10 @@ impl HlsPacketSource {
             transport_origin_seconds,
         );
 
+        let current_stream_map = streams
+            .iter()
+            .map(|stream| (stream.index, stream.index))
+            .collect();
         let mut source = Self {
             segments,
             total_duration_seconds,
@@ -447,6 +453,7 @@ impl HlsPacketSource {
             transport_origin_seconds,
             current_segment: 0,
             current,
+            current_stream_map,
             pending,
             segment_opener,
             readahead: None,
@@ -509,9 +516,10 @@ impl HlsPacketSource {
     }
 
     fn install_segment(&mut self, index: usize, demuxer: Box<dyn Demuxer>) -> Result<()> {
-        validate_stream_layout(&self.streams, demuxer.streams(), index)?;
+        let stream_map = stream_index_map(&self.streams, demuxer.streams(), index)?;
         self.current_segment = index;
         self.current = demuxer;
+        self.current_stream_map = stream_map;
         self.pending.clear();
         self.start_readahead();
         Ok(())
@@ -519,10 +527,15 @@ impl HlsPacketSource {
 
     fn install_prepared_segment(&mut self, prepared: PreparedSegment) -> Result<()> {
         let index = prepared.index;
-        self.install_segment(index, prepared.demuxer)?;
-        if let Some(packet) = prepared.first_packet {
+        self.current_segment = index;
+        self.current = prepared.demuxer;
+        self.current_stream_map = prepared.stream_map;
+        self.pending.clear();
+        if let Some(mut packet) = prepared.first_packet {
+            remap_packet_to_stable(&mut packet, &self.current_stream_map, index)?;
             self.pending.push_back(packet);
         }
+        self.start_readahead();
         Ok(())
     }
 
@@ -537,8 +550,9 @@ impl HlsPacketSource {
         pts: i64,
     ) -> Result<(Box<dyn Demuxer>, i64)> {
         let mut demuxer = self.open_segment(index)?;
-        validate_stream_layout(&self.streams, demuxer.streams(), index)?;
-        let landed = demuxer.seek_to(stream_index, pts)?;
+        let stream_map = stream_index_map(&self.streams, demuxer.streams(), index)?;
+        let local_stream_index = stable_to_local_stream_index(&stream_map, stream_index, index)?;
+        let landed = demuxer.seek_to(local_stream_index, pts)?;
         Ok((demuxer, landed))
     }
 }
@@ -555,10 +569,11 @@ fn prepare_segment(
         Err(Error::Eof) => None,
         Err(error) => return Err(error),
     };
-    validate_stream_layout(&expected_streams, demuxer.streams(), index)?;
+    let stream_map = stream_index_map(&expected_streams, demuxer.streams(), index)?;
     Ok(PreparedSegment {
         index,
         demuxer,
+        stream_map,
         first_packet,
     })
 }
@@ -574,7 +589,14 @@ impl PacketSource for HlsPacketSource {
                 return Ok(packet);
             }
             match self.current.next_packet() {
-                Ok(packet) => return Ok(packet),
+                Ok(mut packet) => {
+                    remap_packet_to_stable(
+                        &mut packet,
+                        &self.current_stream_map,
+                        self.current_segment,
+                    )?;
+                    return Ok(packet);
+                }
                 Err(Error::Eof) => {
                     let next = self.current_segment + 1;
                     if next >= self.segments.len() {
@@ -692,11 +714,11 @@ fn open_segment_demuxer(url: &Url) -> Result<Box<dyn Demuxer>> {
     oxideav_mpegts::open_demuxer(input, &NullCodecResolver)
 }
 
-fn validate_stream_layout(
+fn stream_index_map(
     expected: &[StreamInfo],
     actual: &[StreamInfo],
     segment: usize,
-) -> Result<()> {
+) -> Result<Vec<(u32, u32)>> {
     if expected.len() != actual.len() {
         return Err(Error::invalid(format!(
             "hls: MPEG-TS stream count changed at segment {segment}: expected {}, got {}",
@@ -704,17 +726,80 @@ fn validate_stream_layout(
             actual.len()
         )));
     }
-    for (expected, actual) in expected.iter().zip(actual) {
-        if expected.index != actual.index
-            || expected.params.media_type != actual.params.media_type
-            || expected.params.codec_id != actual.params.codec_id
-        {
+
+    let same_layout = expected.iter().zip(actual).all(|(expected, actual)| {
+        expected.params.media_type == actual.params.media_type
+            && expected.params.codec_id == actual.params.codec_id
+    });
+    if same_layout {
+        return Ok(actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual.index, expected.index))
+            .collect());
+    }
+
+    let mut mapping = Vec::with_capacity(actual.len());
+    let mut matched_stable = HashSet::with_capacity(expected.len());
+    for actual_stream in actual {
+        let candidates = expected
+            .iter()
+            .filter(|expected_stream| {
+                expected_stream.params.media_type == actual_stream.params.media_type
+                    && expected_stream.params.codec_id == actual_stream.params.codec_id
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
             return Err(Error::invalid(format!(
-                "hls: MPEG-TS stream layout changed at segment {segment}"
+                "hls: MPEG-TS stream layout changed ambiguously at segment {segment}: local stream {} ({:?}/{}) matched {} stable streams",
+                actual_stream.index,
+                actual_stream.params.media_type,
+                actual_stream.params.codec_id,
+                candidates.len()
             )));
         }
+        let stable_index = candidates[0].index;
+        if !matched_stable.insert(stable_index) {
+            return Err(Error::invalid(format!(
+                "hls: MPEG-TS stream layout changed ambiguously at segment {segment}: stable stream {stable_index} matched more than once"
+            )));
+        }
+        mapping.push((actual_stream.index, stable_index));
     }
+    Ok(mapping)
+}
+
+fn remap_packet_to_stable(
+    packet: &mut Packet,
+    stream_map: &[(u32, u32)],
+    segment: usize,
+) -> Result<()> {
+    let stable_index = stream_map
+        .iter()
+        .find_map(|(local, stable)| (*local == packet.stream_index).then_some(*stable))
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "hls: packet referenced unknown local stream {} at segment {segment}",
+                packet.stream_index
+            ))
+        })?;
+    packet.stream_index = stable_index;
     Ok(())
+}
+
+fn stable_to_local_stream_index(
+    stream_map: &[(u32, u32)],
+    stable_index: u32,
+    segment: usize,
+) -> Result<u32> {
+    stream_map
+        .iter()
+        .find_map(|(local, stable)| (*stable == stable_index).then_some(*local))
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "hls: stable stream {stable_index} has no local mapping at segment {segment}"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -779,6 +864,67 @@ mod tests {
             duration: None,
             start_time: Some(0),
             params,
+        }
+    }
+
+    fn typed_stream(index: u32, media_type: MediaType, codec: &str) -> StreamInfo {
+        let mut params = match media_type {
+            MediaType::Video => CodecParameters::video(CodecId::new(codec)),
+            MediaType::Audio => CodecParameters::audio(CodecId::new(codec)),
+            MediaType::Data => CodecParameters::data(CodecId::new(codec)),
+            MediaType::Subtitle => CodecParameters::subtitle(CodecId::new(codec)),
+            MediaType::Unknown => CodecParameters::data(CodecId::new(codec)),
+        };
+        params.media_type = media_type;
+        params.codec_id = CodecId::new(codec);
+        StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 90_000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        }
+    }
+
+    fn twitch_layout() -> Vec<StreamInfo> {
+        vec![
+            typed_stream(0, MediaType::Audio, "aac"),
+            typed_stream(1, MediaType::Video, "h264"),
+            typed_stream(2, MediaType::Data, "timed_id3"),
+        ]
+    }
+
+    fn twitch_muted_reordered_layout() -> Vec<StreamInfo> {
+        vec![
+            typed_stream(0, MediaType::Data, "timed_id3"),
+            typed_stream(1, MediaType::Video, "h264"),
+            typed_stream(2, MediaType::Audio, "aac"),
+        ]
+    }
+
+    struct LayoutDemuxer {
+        streams: Vec<StreamInfo>,
+        packets: VecDeque<Packet>,
+        seek_stream: Arc<AtomicUsize>,
+    }
+
+    impl Demuxer for LayoutDemuxer {
+        fn format_name(&self) -> &str {
+            "fake-layout-mpegts"
+        }
+
+        fn streams(&self) -> &[StreamInfo] {
+            &self.streams
+        }
+
+        fn next_packet(&mut self) -> Result<Packet> {
+            self.packets.pop_front().ok_or(Error::Eof)
+        }
+
+        fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+            self.seek_stream
+                .store(stream_index as usize, Ordering::SeqCst);
+            Ok(pts)
         }
     }
 
@@ -1061,5 +1207,128 @@ mod tests {
         assert_eq!(source.readahead.as_ref().map(|r| r.index), Some(3));
         wait_for_count(&read_counts[3], 1);
         assert_eq!(open_counts[3].load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn reordered_mpegts_streams_keep_stable_hls_packet_indices() {
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let media = fake_media(2);
+        let seek_stream = Arc::new(AtomicUsize::new(usize::MAX));
+        let opener: SegmentOpener = {
+            let seek_stream = Arc::clone(&seek_stream);
+            Arc::new(move |url| {
+                let segment = segment_number(url);
+                let streams = if segment == 0 {
+                    twitch_layout()
+                } else {
+                    twitch_muted_reordered_layout()
+                };
+                let packets = if segment == 0 {
+                    VecDeque::from([
+                        Packet::new(0, TimeBase::new(1, 90_000), vec![0]).with_pts(0),
+                        Packet::new(1, TimeBase::new(1, 90_000), vec![1]).with_pts(0),
+                        Packet::new(2, TimeBase::new(1, 90_000), vec![2]).with_pts(0),
+                    ])
+                } else {
+                    VecDeque::from([
+                        Packet::new(0, TimeBase::new(1, 90_000), vec![10]).with_pts(900_000),
+                        Packet::new(1, TimeBase::new(1, 90_000), vec![11]).with_pts(900_000),
+                        Packet::new(2, TimeBase::new(1, 90_000), vec![12]).with_pts(900_000),
+                    ])
+                };
+                Ok(Box::new(LayoutDemuxer {
+                    streams,
+                    packets,
+                    seek_stream: Arc::clone(&seek_stream),
+                }))
+            })
+        };
+
+        let mut source = HlsPacketSource::open_with_opener(&media_url, &media, opener).unwrap();
+        assert_eq!(
+            source
+                .streams()
+                .iter()
+                .map(|stream| stream.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        assert_eq!(source.next_packet().unwrap().stream_index, 0);
+        assert_eq!(source.next_packet().unwrap().stream_index, 1);
+        assert_eq!(source.next_packet().unwrap().stream_index, 2);
+
+        let first_reordered = source.next_packet().unwrap();
+        assert_eq!(first_reordered.data, vec![10]);
+        assert_eq!(
+            first_reordered.stream_index, 2,
+            "local timed-ID3 stream 0 must remain stable HLS stream 2"
+        );
+        assert_eq!(source.next_packet().unwrap().stream_index, 1);
+        assert_eq!(
+            source.next_packet().unwrap().stream_index,
+            0,
+            "local AAC stream 2 must remain stable HLS stream 0"
+        );
+    }
+
+    #[test]
+    fn reordered_layout_maps_stable_seek_indices_back_to_segment_local_indices() {
+        let expected = twitch_layout();
+        let actual = vec![
+            typed_stream(0, MediaType::Video, "h264"),
+            typed_stream(1, MediaType::Audio, "aac"),
+            typed_stream(2, MediaType::Data, "timed_id3"),
+        ];
+        let mapping = stream_index_map(&expected, &actual, 936).unwrap();
+
+        assert_eq!(stable_to_local_stream_index(&mapping, 0, 936).unwrap(), 1);
+        assert_eq!(stable_to_local_stream_index(&mapping, 1, 936).unwrap(), 0);
+        assert_eq!(stable_to_local_stream_index(&mapping, 2, 936).unwrap(), 2);
+    }
+
+    #[test]
+    fn genuine_stream_layout_changes_still_fail() {
+        let expected = twitch_layout();
+
+        let changed_codec = vec![
+            typed_stream(0, MediaType::Audio, "mp3"),
+            typed_stream(1, MediaType::Video, "h264"),
+            typed_stream(2, MediaType::Data, "timed_id3"),
+        ];
+        let error = stream_index_map(&expected, &changed_codec, 936).unwrap_err();
+        assert!(
+            error.to_string().contains("stream layout changed"),
+            "unexpected codec-change error: {error}"
+        );
+
+        let missing_stream = vec![
+            typed_stream(0, MediaType::Audio, "aac"),
+            typed_stream(1, MediaType::Video, "h264"),
+        ];
+        let error = stream_index_map(&expected, &missing_stream, 936).unwrap_err();
+        assert!(
+            error.to_string().contains("stream count changed"),
+            "unexpected count-change error: {error}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_duplicate_codec_reordering_fails_instead_of_guessing() {
+        let expected = vec![
+            typed_stream(0, MediaType::Audio, "aac"),
+            typed_stream(1, MediaType::Audio, "aac"),
+            typed_stream(2, MediaType::Video, "h264"),
+        ];
+        let actual = vec![
+            typed_stream(0, MediaType::Video, "h264"),
+            typed_stream(1, MediaType::Audio, "aac"),
+            typed_stream(2, MediaType::Audio, "aac"),
+        ];
+
+        let error = stream_index_map(&expected, &actual, 12).unwrap_err();
+        assert!(
+            error.to_string().contains("ambiguously"),
+            "unexpected ambiguous-layout error: {error}"
+        );
     }
 }
