@@ -667,6 +667,10 @@ impl PacketSource for HlsPacketSource {
         Ok(landed)
     }
 
+    fn supports_seek(&self) -> bool {
+        true
+    }
+
     fn duration_micros(&self) -> Option<i64> {
         Some((self.total_duration_seconds * 1_000_000.0).round() as i64)
     }
