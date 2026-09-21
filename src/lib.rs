@@ -25,8 +25,8 @@ use m3u8_rs::{
     AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
 };
 use oxideav_core::{
-    BytesSource, Demuxer, Error, NullCodecResolver, Packet, PacketSource, ReadSeek, Result,
-    RuntimeContext, StreamInfo,
+    BytesSource, CancellationToken, Demuxer, Error, NullCodecResolver, Packet, PacketSource,
+    ReadSeek, Result, RuntimeContext, StreamInfo,
 };
 use url::Url;
 
@@ -95,6 +95,32 @@ pub fn inspect_hls(uri: &str) -> Result<HlsPlaylistInfo> {
     }
 }
 
+/// Cancellation-aware form of [`inspect_hls`]. The playlist GET itself is
+/// aborted when `cancellation` is cancelled.
+pub fn inspect_hls_cancellable(
+    uri: &str,
+    cancellation: &CancellationToken,
+) -> Result<HlsPlaylistInfo> {
+    let playlist_url = unwrap_hls_uri(uri)?;
+    match fetch_playlist_cancellable(&playlist_url, cancellation)? {
+        Playlist::MediaPlaylist(_) => {
+            log::info!("oxideav-hls: inspected media playlist: {playlist_url}");
+            Ok(HlsPlaylistInfo::Media { url: playlist_url })
+        }
+        Playlist::MasterPlaylist(master) => {
+            log::info!(
+                "oxideav-hls: inspected master playlist: {} variants: {playlist_url}",
+                master
+                    .variants
+                    .iter()
+                    .filter(|variant| !variant.is_i_frame)
+                    .count()
+            );
+            inspect_master(&playlist_url, &master)
+        }
+    }
+}
+
 pub fn register(ctx: &mut RuntimeContext) {
     ctx.sources.register_packets("hls+http", open_hls);
     ctx.sources.register_packets("hls+https", open_hls);
@@ -131,6 +157,14 @@ fn fetch_playlist(url: &Url) -> Result<Playlist> {
     // Use oxideav-http's bounded GET helper rather than its seekable
     // HEAD+Range media-source primitive.
     let bytes = oxideav_http::fetch_bytes(url.as_str(), MAX_PLAYLIST_BYTES)?;
+    let (_, playlist) = m3u8_rs::parse_playlist(&bytes)
+        .map_err(|e| Error::invalid(format!("hls: failed to parse playlist {url}: {e:?}")))?;
+    Ok(playlist)
+}
+
+fn fetch_playlist_cancellable(url: &Url, cancellation: &CancellationToken) -> Result<Playlist> {
+    let bytes =
+        oxideav_http::fetch_bytes_cancellable(url.as_str(), MAX_PLAYLIST_BYTES, cancellation)?;
     let (_, playlist) = m3u8_rs::parse_playlist(&bytes)
         .map_err(|e| Error::invalid(format!("hls: failed to parse playlist {url}: {e:?}")))?;
     Ok(playlist)
@@ -813,6 +847,15 @@ mod tests {
     use oxideav_core::{CodecId, CodecParameters, MediaType, TimeBase};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn cancelled_inspection_does_not_start_http_request() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = inspect_hls_cancellable("hls+http://127.0.0.1:9/never-requested.m3u8", &token)
+            .expect_err("pre-cancelled inspection must fail");
+        assert!(error.is_cancelled(), "unexpected error: {error}");
+    }
 
     struct FakeDemuxer {
         streams: Vec<StreamInfo>,
