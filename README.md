@@ -3,26 +3,25 @@
 Minimal HLS VOD packet-source integration for the OxideAV framework.
 
 The crate deliberately keeps HLS as a **source-layer concern**. It resolves a
-master/media playlist, opens each MPEG-TS segment through `oxideav-http`, and
-owns the active `oxideav-mpegts` demuxer. Downstream OxideAV code sees one
+master/media playlist, opens each segment through `oxideav-http`, and
+owns its MPEG-TS or MP4 demuxer. Downstream OxideAV code sees one
 continuous `PacketSource`; it does not need to know where HLS segment
 boundaries occur.
 
 ## Current scope
 
-The implementation targets the classic VOD shape used by the
-Real-world HLS VOD validation:
+The implementation targets completed VOD playlists with MPEG-TS or fMP4 media:
 
 - HTTP(S) master or media playlists;
 - completed VOD/event playlists carrying `#EXT-X-ENDLIST`;
 - one fixed rendition selected when the source opens;
-- whole-file MPEG-TS segments;
+- MPEG-TS segments and mapped fragmented MP4 segments;
 - relative playlist/segment URI resolution;
 - `#EXTINF`-indexed media-time seeking;
 - one-segment successor readahead;
+- segment and initialization-map byte ranges;
+- cached initialization maps reused across segments and seeks;
 - no encryption;
-- no byte ranges;
-- no `#EXT-X-MAP` / fMP4;
 - no discontinuities;
 - no I-frames-only playlists;
 - no nested master playlists;
@@ -42,7 +41,7 @@ hls+https://...
 
 The extra `hls+` prefix makes HLS source selection explicit. Playlist and
 segment transfers are delegated to `oxideav-http`, while MPEG-TS demuxing is
-delegated to `oxideav-mpegts`.
+delegated to `oxideav-mpegts` and fMP4 demuxing to `oxideav-mp4`.
 
 ## Rendition selection
 
@@ -78,12 +77,12 @@ HTTP driver. Playlist metadata is capped at 4 MiB.
 ## Packet source and segment progression
 
 Opening a media playlist builds a lightweight in-memory segment index from its
-resolved segment URLs and `#EXTINF` durations. Segment byte lengths are not
-needed and segments are not modelled as one concatenated byte stream.
+resolved segment URLs, optional byte ranges and initialization maps, and
+`#EXTINF` durations. Segments are not modelled as one long byte stream.
 
 `HlsPacketSource` owns:
 
-- the active MPEG-TS demuxer for the current segment;
+- the active MPEG-TS or MP4 demuxer for the current segment;
 - the stream metadata exposed to downstream consumers;
 - the playlist-duration/media-time segment index;
 - a small queue of packets primed during startup or successor preparation; and
@@ -93,9 +92,17 @@ The first segment is opened immediately. During startup, a bounded packet prefix
 is read until timestamped packets establish trustworthy stream start times.
 Those packets are retained and replayed unchanged through `next_packet()`.
 
-When the active segment reaches EOF, the next prepared MPEG-TS demuxer is
+When the active segment reaches EOF, the next prepared segment demuxer is
 installed and packet delivery continues across the HLS boundary without exposing
 that boundary downstream.
+
+For `#EXT-X-MAP`, the source fetches the referenced initialization section
+(honouring its optional `BYTERANGE`) and caches it by URL and byte range.
+It presents that section followed by one media segment as a seekable view to
+the MP4 demuxer. The same map is reused for later segments and seeks; a new
+map switches the initialization data. The cache holds at most four maps of up
+to 8 MiB each. Segment `#EXT-X-BYTERANGE` is also
+honoured, including implicit offsets following a range on the same resource.
 
 ## Successor readahead
 
@@ -104,7 +111,7 @@ Exactly one successor segment is prepared in the background.
 While segment N is active, a worker for segment N+1:
 
 1. opens the segment's HTTP resource;
-2. creates its MPEG-TS demuxer;
+2. creates its MPEG-TS or MP4 demuxer;
 3. validates that its stream layout matches the current rendition; and
 4. primes the first packet.
 
@@ -126,7 +133,7 @@ installed, readahead begins again for that segment's successor.
 segment's media-relative start time and the total VOD duration when the playlist
 is opened.
 
-MPEG-TS timestamps are transport timestamps rather than zero-based media time.
+Segment timestamps are transport timestamps rather than zero-based media time.
 During first-segment priming, `HlsPacketSource` derives a transport-time origin
 from the earliest trustworthy stream/packet timestamp. A requested raw PTS is
 therefore mapped to media time as:
@@ -136,12 +143,12 @@ media time = transport PTS time - transport origin
 ```
 
 The media-relative target selects a segment directly from the `#EXTINF` index.
-That segment is opened and its MPEG-TS demuxer performs the actual timestamp
+That segment is opened and its demuxer performs the actual timestamp
 seek. For A/V renditions, the video stream is preferred for access-point
 selection so the landing is video-decode-safe even when the caller addressed
 the audio route.
 
-`#EXTINF` timing is nominal and can differ slightly from MPEG-TS access-point
+`#EXTINF` timing is nominal and can differ slightly from access-point
 timing. If the chosen segment can only land after the requested PTS, the source
 retries the preceding segment so the seek contract remains the nearest
 decode-safe point at or before the target.
@@ -155,7 +162,8 @@ timeline only to choose the correct segment efficiently.
 The implementation has been exercised against:
 
 - the public Big Buck Bunny HLS master/720p60 MPEG-TS stream; and
-- signed Twitch VOD playlists containing thousands of MPEG-TS segments.
+- signed Twitch VOD playlists containing thousands of MPEG-TS segments; and
+- a YouTube VOD using mapped fMP4 H.264 segments, including a seek to 389 s.
 
 The Twitch playlists are intentionally not committed: their signed URLs contain
 short-lived tokens. Real segment media used for regressions lives separately in
@@ -163,7 +171,7 @@ local integration fixtures.
 
 ## Future work
 
-Remaining HLS format work includes discontinuity handling, byte-range segments,
-`#EXT-X-MAP`/fMP4, encryption/key handling and live playlist reload.
+Remaining HLS format work includes discontinuity handling, encryption/key
+handling, separate audio renditions, and live playlist reload.
 
 MIT.

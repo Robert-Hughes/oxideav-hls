@@ -1,24 +1,24 @@
 //! Minimal HLS VOD source for OxideAV.
 //!
-//! V1 deliberately targets the classic MPEG-TS HLS shape used by the
-//! Real-world HLS VOD validation:
+//! VOD support covers MPEG-TS segments and mapped fMP4 fragments:
 //! * HTTP(S) master or media playlists;
 //! * VOD (`#EXT-X-ENDLIST`) only;
 //! * one fixed rendition selected at open time;
-//! * ordinary whole-file MPEG-TS segments;
-//! * no encryption, byte ranges, init maps, discontinuities, or live reloads.
+//! * MPEG-TS segments and fMP4 segments with `#EXT-X-MAP`;
+//! * optional segment and initialization-map byte ranges;
+//! * no encryption, discontinuities, or live reloads.
 //!
 //! `m3u8-rs` parses the playlists; `oxideav-http` performs every HTTP transfer.
-//! The source exposes already-demuxed packets while owning the active MPEG-TS
+//! The source exposes already-demuxed packets while owning the active segment
 //! demuxer plus one HLS-local successor readahead. The successor is opened on a
 //! background thread and primed through its first packet so HTTP setup and initial
 //! demux work overlap playback of the current segment. `#EXTINF` durations provide
 //! a media-time index, so seeking jumps directly to one segment instead of byte-
 //! bisecting a virtual concatenation of every object in a long VOD.
 
-use std::collections::{HashSet, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
-use std::sync::{mpsc, Arc};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use m3u8_rs::{
@@ -32,6 +32,8 @@ use url::Url;
 
 const DEFAULT_MAX_HEIGHT: u64 = 720;
 const MAX_PLAYLIST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_INIT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CACHED_MAPS: usize = 4;
 
 /// One non-I-frame rendition advertised by an HLS master playlist.
 ///
@@ -314,19 +316,9 @@ fn validate_media_playlist(media: &MediaPlaylist) -> Result<()> {
 }
 
 fn validate_segment(idx: usize, segment: &m3u8_rs::MediaSegment) -> Result<()> {
-    if segment.byte_range.is_some() {
-        return Err(Error::unsupported(format!(
-            "hls: segment {idx} uses #EXT-X-BYTERANGE; V1 supports whole-file segments only"
-        )));
-    }
     if segment.discontinuity {
         return Err(Error::unsupported(format!(
-            "hls: segment {idx} begins a discontinuity; V1 supports one continuous MPEG-TS timeline"
-        )));
-    }
-    if segment.map.is_some() {
-        return Err(Error::unsupported(format!(
-            "hls: segment {idx} uses #EXT-X-MAP (typically fMP4); V1 supports MPEG-TS segments only"
+            "hls: segment {idx} begins a discontinuity; V1 supports one continuous timeline"
         )));
     }
     if let Some(key) = &segment.key {
@@ -354,8 +346,64 @@ fn require_http(url: &Url, what: &str) -> Result<()> {
 #[derive(Clone, Debug)]
 struct SegmentEntry {
     url: Url,
+    range: Option<ByteWindowSpec>,
+    map: Option<MapKey>,
     start_seconds: f64,
     duration_seconds: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ByteWindowSpec {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MapKey {
+    url: Url,
+    range: Option<ByteWindowSpec>,
+}
+
+#[derive(Default)]
+struct CachedMaps {
+    entries: HashMap<MapKey, Arc<Vec<u8>>>,
+    insertion_order: VecDeque<MapKey>,
+}
+
+#[derive(Default)]
+struct MapCache(Mutex<CachedMaps>);
+
+impl MapCache {
+    fn get_or_fetch(&self, key: &MapKey) -> Result<Arc<Vec<u8>>> {
+        self.get_or_insert_with(key, || fetch_map(key))
+    }
+
+    fn get_or_insert_with(
+        &self,
+        key: &MapKey,
+        fetch: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<Arc<Vec<u8>>> {
+        // Hold the lock through the fetch: readahead and a concurrent seek
+        // must not download the same initialization section twice.
+        let mut maps = self
+            .0
+            .lock()
+            .map_err(|_| Error::other("hls: initialization map cache poisoned"))?;
+        if let Some(bytes) = maps.entries.get(key) {
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes = Arc::new(fetch()?);
+        if maps.entries.len() == MAX_CACHED_MAPS {
+            let oldest = maps
+                .insertion_order
+                .pop_front()
+                .expect("cache order exists");
+            maps.entries.remove(&oldest);
+        }
+        maps.insertion_order.push_back(key.clone());
+        maps.entries.insert(key.clone(), Arc::clone(&bytes));
+        Ok(bytes)
+    }
 }
 
 /// `Box<dyn BytesSource>` cannot be directly coerced to `Box<dyn ReadSeek>`
@@ -375,7 +423,134 @@ impl Seek for SegmentReader {
     }
 }
 
-type SegmentOpener = Arc<dyn Fn(&Url) -> Result<Box<dyn Demuxer>> + Send + Sync + 'static>;
+/// A seekable view of an HLS BYTERANGE within one HTTP resource.
+struct ByteWindow {
+    source: Box<dyn BytesSource>,
+    spec: ByteWindowSpec,
+    pos: u64,
+}
+
+impl ByteWindow {
+    fn new(mut source: Box<dyn BytesSource>, spec: ByteWindowSpec) -> Result<Self> {
+        let end = spec
+            .offset
+            .checked_add(spec.length)
+            .ok_or_else(|| Error::invalid("hls: byte range end overflow"))?;
+        let total = source.seek(SeekFrom::End(0))?;
+        if end > total {
+            return Err(Error::invalid(format!(
+                "hls: byte range {}..{end} exceeds resource length {total}",
+                spec.offset
+            )));
+        }
+        Ok(Self {
+            source,
+            spec,
+            pos: 0,
+        })
+    }
+}
+
+impl Read for ByteWindow {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.spec.length - self.pos;
+        let count = out
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if count == 0 {
+            return Ok(0);
+        }
+        self.source
+            .seek(SeekFrom::Start(self.spec.offset + self.pos))?;
+        let read = self.source.read(&mut out[..count])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for ByteWindow {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.pos = bounded_seek(self.pos, self.spec.length, from)?;
+        Ok(self.pos)
+    }
+}
+
+/// Expose an init section and one fMP4 fragment as one logical file.
+/// MP4's fragment-relative offsets then remain correct without copying
+/// or rewriting either object.
+struct InitAndSegment {
+    init: Arc<Vec<u8>>,
+    segment: Box<dyn ReadSeek>,
+    segment_len: u64,
+    pos: u64,
+}
+
+impl InitAndSegment {
+    fn new(init: Arc<Vec<u8>>, mut segment: Box<dyn ReadSeek>) -> Result<Self> {
+        let segment_len = segment.seek(SeekFrom::End(0))?;
+        (init.len() as u64)
+            .checked_add(segment_len)
+            .ok_or_else(|| Error::invalid("hls: mapped segment length overflow"))?;
+        segment.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            init,
+            segment,
+            segment_len,
+            pos: 0,
+        })
+    }
+
+    fn len(&self) -> u64 {
+        self.init.len() as u64 + self.segment_len
+    }
+}
+
+impl Read for InitAndSegment {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.init.len() as u64 {
+            let start = self.pos as usize;
+            let count = out.len().min(self.init.len() - start);
+            out[..count].copy_from_slice(&self.init[start..start + count]);
+            self.pos += count as u64;
+            return Ok(count);
+        }
+        if self.pos >= self.len() || out.is_empty() {
+            return Ok(0);
+        }
+        let local = self.pos - self.init.len() as u64;
+        self.segment.seek(SeekFrom::Start(local))?;
+        let count = out
+            .len()
+            .min(usize::try_from(self.segment_len - local).unwrap_or(usize::MAX));
+        let read = self.segment.read(&mut out[..count])?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for InitAndSegment {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        self.pos = bounded_seek(self.pos, self.len(), from)?;
+        Ok(self.pos)
+    }
+}
+
+fn bounded_seek(current: u64, len: u64, from: SeekFrom) -> io::Result<u64> {
+    let target = match from {
+        SeekFrom::Start(pos) => pos as i128,
+        SeekFrom::Current(delta) => current as i128 + delta as i128,
+        SeekFrom::End(delta) => len as i128 + delta as i128,
+    };
+    if target < 0 || target > len as i128 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "seek outside HLS resource",
+        ));
+    }
+    Ok(target as u64)
+}
+
+type SegmentOpener = Arc<dyn Fn(&SegmentEntry) -> Result<Box<dyn Demuxer>> + Send + Sync + 'static>;
 
 struct PreparedSegment {
     index: usize,
@@ -404,7 +579,12 @@ struct HlsPacketSource {
 
 impl HlsPacketSource {
     fn open(media_url: &Url, media: &MediaPlaylist) -> Result<Self> {
-        Self::open_with_opener(media_url, media, Arc::new(open_segment_demuxer))
+        let maps = Arc::new(MapCache::default());
+        Self::open_with_opener(
+            media_url,
+            media,
+            Arc::new(move |segment| open_segment_demuxer(segment, &maps)),
+        )
     }
 
     fn open_with_opener(
@@ -417,7 +597,7 @@ impl HlsPacketSource {
             .last()
             .map(|segment| segment.start_seconds + segment.duration_seconds)
             .unwrap_or(0.0);
-        let mut current = segment_opener(&segments[0].url)?;
+        let mut current = segment_opener(&segments[0])?;
 
         // MPEG-TS learns each stream's first PTS only as PES packets flow. Cache
         // a small initial prefix so the PacketSource can advertise trustworthy
@@ -458,9 +638,7 @@ impl HlsPacketSource {
                     .filter(|seconds| seconds.is_finite())
                     .min_by(f64::total_cmp)
             })
-            .ok_or_else(|| {
-                Error::invalid("hls: first MPEG-TS segment exposed no timestamped packets")
-            })?;
+            .ok_or_else(|| Error::invalid("hls: first segment exposed no timestamped packets"))?;
 
         for stream in &mut streams {
             let tick_seconds = stream.time_base.as_rational().as_f64();
@@ -497,7 +675,7 @@ impl HlsPacketSource {
     }
 
     fn open_segment(&self, index: usize) -> Result<Box<dyn Demuxer>> {
-        (self.segment_opener)(&self.segments[index].url)
+        (self.segment_opener)(&self.segments[index])
     }
 
     fn start_readahead(&mut self) {
@@ -507,14 +685,14 @@ impl HlsPacketSource {
             return;
         }
 
-        let url = self.segments[index].url.clone();
+        let segment = self.segments[index].clone();
         let expected_streams = self.streams.clone();
         let opener = Arc::clone(&self.segment_opener);
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(format!("oxideav-hls-readahead-{index}"))
             .spawn(move || {
-                let result = prepare_segment(index, url, expected_streams, opener);
+                let result = prepare_segment(index, segment, expected_streams, opener);
                 let _ = sender.send(result);
             });
 
@@ -543,7 +721,7 @@ impl HlsPacketSource {
 
         prepare_segment(
             index,
-            self.segments[index].url.clone(),
+            self.segments[index].clone(),
             self.streams.clone(),
             Arc::clone(&self.segment_opener),
         )
@@ -593,11 +771,11 @@ impl HlsPacketSource {
 
 fn prepare_segment(
     index: usize,
-    url: Url,
+    segment: SegmentEntry,
     expected_streams: Vec<StreamInfo>,
     opener: SegmentOpener,
 ) -> Result<PreparedSegment> {
-    let mut demuxer = opener(&url)?;
+    let mut demuxer = opener(&segment)?;
     let first_packet = match demuxer.next_packet() {
         Ok(packet) => Some(packet),
         Err(Error::Eof) => None,
@@ -651,18 +829,17 @@ impl PacketSource for HlsPacketSource {
             .find(|stream| stream.index == stream_index)
             .ok_or_else(|| Error::invalid(format!("hls: no stream with index {stream_index}")))?;
         let time_base = requested_stream.time_base;
-        // For A/V HLS, landing must be video-decode-safe even when the
-        // application addressed the audio route (sink-facing and source stream
-        // indices need not have the same ordering). MPEG-TS uses the same
-        // 90 kHz time base for every elementary stream, so the target PTS is
-        // unchanged when we prefer the first video stream for access-point
-        // selection. Audio-only renditions keep the requested stream.
-        let seek_stream_index = self
+        // Prefer a video access point even when the caller addressed audio.
+        // fMP4 tracks can use different time bases, unlike MPEG-TS's shared
+        // 90 kHz clock, so rescale both the target and the returned landing.
+        let seek_stream = self
             .streams
             .iter()
             .find(|stream| stream.params.media_type == oxideav_core::MediaType::Video)
-            .map(|stream| stream.index)
-            .unwrap_or(stream_index);
+            .unwrap_or(requested_stream);
+        let seek_stream_index = seek_stream.index;
+        let seek_time_base = seek_stream.time_base;
+        let seek_pts = time_base.rescale(pts, seek_time_base);
         let raw_seconds = time_base.seconds_of(pts);
         if !raw_seconds.is_finite() {
             return Err(Error::invalid("hls: seek target is not a finite timestamp"));
@@ -676,16 +853,16 @@ impl PacketSource for HlsPacketSource {
             self.segments[index].start_seconds,
         );
 
-        let (mut demuxer, mut landed) = self.seek_in_segment(index, seek_stream_index, pts)?;
+        let (mut demuxer, mut landed) = self.seek_in_segment(index, seek_stream_index, seek_pts)?;
         let mut landed_index = index;
 
         // EXTINF timing is nominal and can differ by a few ticks from the TS
         // access-point timeline. If the selected segment can only clamp upward
         // past the requested PTS, seek the preceding segment instead so the
         // public "nearest decode-safe point at or before target" contract holds.
-        if landed > pts && index > 0 {
+        if landed > seek_pts && index > 0 {
             let previous = index - 1;
-            let result = self.seek_in_segment(previous, seek_stream_index, pts)?;
+            let result = self.seek_in_segment(previous, seek_stream_index, seek_pts)?;
             demuxer = result.0;
             landed = result.1;
             landed_index = previous;
@@ -695,10 +872,10 @@ impl PacketSource for HlsPacketSource {
         log::info!(
             "oxideav-hls: seek landed segment={} raw={:.3}s media={:.3}s",
             landed_index,
-            time_base.seconds_of(landed),
-            time_base.seconds_of(landed) - self.transport_origin_seconds,
+            seek_time_base.seconds_of(landed),
+            seek_time_base.seconds_of(landed) - self.transport_origin_seconds,
         );
-        Ok(landed)
+        Ok(seek_time_base.rescale(landed, time_base))
     }
 
     fn supports_seek(&self) -> bool {
@@ -713,6 +890,7 @@ impl PacketSource for HlsPacketSource {
 fn build_segment_index(media_url: &Url, media: &MediaPlaylist) -> Result<Vec<SegmentEntry>> {
     let mut segments = Vec::with_capacity(media.segments.len());
     let mut start_seconds = 0.0_f64;
+    let mut previous_map: Option<(m3u8_rs::Map, MapKey)> = None;
     for (index, segment) in media.segments.iter().enumerate() {
         validate_segment(index, segment)?;
         let url = media_url.join(&segment.uri).map_err(|error| {
@@ -722,6 +900,45 @@ fn build_segment_index(media_url: &Url, media: &MediaPlaylist) -> Result<Vec<Seg
             ))
         })?;
         require_http(&url, "segment")?;
+        let previous_segment_range = segments
+            .last()
+            .and_then(|previous: &SegmentEntry| previous.range.map(|range| (&previous.url, range)));
+        let range = segment
+            .byte_range
+            .as_ref()
+            .map(|raw| resolve_byte_range(raw, previous_segment_range, &url, "segment"))
+            .transpose()?;
+        let map = if let Some(raw_map) = segment.map.as_ref() {
+            if let Some((_, key)) = previous_map.as_ref().filter(|(old, _)| old == raw_map) {
+                Some(key.clone())
+            } else {
+                let map_url = media_url.join(&raw_map.uri).map_err(|error| {
+                    Error::invalid(format!(
+                        "hls: invalid initialization map URI {:?}: {error}",
+                        raw_map.uri
+                    ))
+                })?;
+                require_http(&map_url, "initialization map")?;
+                let previous_range = previous_map
+                    .as_ref()
+                    .and_then(|(_, key)| key.range.map(|range| (&key.url, range)));
+                let map_range = raw_map
+                    .byte_range
+                    .as_ref()
+                    .map(|raw| {
+                        resolve_byte_range(raw, previous_range, &map_url, "initialization map")
+                    })
+                    .transpose()?;
+                let key = MapKey {
+                    url: map_url,
+                    range: map_range,
+                };
+                previous_map = Some((raw_map.clone(), key.clone()));
+                Some(key)
+            }
+        } else {
+            None
+        };
         let duration_seconds = f64::from(segment.duration);
         if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
             return Err(Error::invalid(format!(
@@ -731,12 +948,45 @@ fn build_segment_index(media_url: &Url, media: &MediaPlaylist) -> Result<Vec<Seg
         }
         segments.push(SegmentEntry {
             url,
+            range,
+            map,
             start_seconds,
             duration_seconds,
         });
         start_seconds += duration_seconds;
     }
     Ok(segments)
+}
+
+fn resolve_byte_range(
+    raw: &m3u8_rs::ByteRange,
+    previous: Option<(&Url, ByteWindowSpec)>,
+    url: &Url,
+    what: &str,
+) -> Result<ByteWindowSpec> {
+    if raw.length == 0 {
+        return Err(Error::invalid(format!(
+            "hls: {what} has an empty byte range"
+        )));
+    }
+    let offset = match raw.offset {
+        Some(offset) => offset,
+        None => previous
+            .filter(|(previous_url, _)| *previous_url == url)
+            .and_then(|(_, range)| range.offset.checked_add(range.length))
+            .ok_or_else(|| {
+                Error::invalid(format!(
+                    "hls: {what} byte range omits its offset without a preceding range on the same resource"
+                ))
+            })?,
+    };
+    offset
+        .checked_add(raw.length)
+        .ok_or_else(|| Error::invalid(format!("hls: {what} byte range end overflow")))?;
+    Ok(ByteWindowSpec {
+        offset,
+        length: raw.length,
+    })
 }
 
 fn segment_index_for_media_seconds(segments: &[SegmentEntry], seconds: f64) -> usize {
@@ -746,10 +996,60 @@ fn segment_index_for_media_seconds(segments: &[SegmentEntry], seconds: f64) -> u
     insertion.saturating_sub(1).min(segments.len() - 1)
 }
 
-fn open_segment_demuxer(url: &Url) -> Result<Box<dyn Demuxer>> {
-    let bytes = oxideav_http::open_http(url.as_str())?;
-    let input: Box<dyn ReadSeek> = Box::new(SegmentReader(bytes));
-    oxideav_mpegts::open_demuxer(input, &NullCodecResolver)
+fn open_segment_demuxer(segment: &SegmentEntry, maps: &MapCache) -> Result<Box<dyn Demuxer>> {
+    let bytes = oxideav_http::open_http(segment.url.as_str())?;
+    let input = windowed_reader(bytes, segment.range)?;
+    if let Some(map) = &segment.map {
+        let init = maps.get_or_fetch(map)?;
+        let is_mp4 = init.get(4..8) == Some(b"ftyp") || init.get(4..8) == Some(b"moov");
+        let is_ts = init.first() == Some(&0x47);
+        let combined: Box<dyn ReadSeek> = Box::new(InitAndSegment::new(init, input)?);
+        if is_mp4 {
+            oxideav_mp4::demux::open(combined, &NullCodecResolver)
+        } else if is_ts {
+            oxideav_mpegts::open_demuxer(combined, &NullCodecResolver)
+        } else {
+            Err(Error::unsupported(
+                "hls: EXT-X-MAP initialization data is neither fMP4 nor MPEG-TS",
+            ))
+        }
+    } else {
+        oxideav_mpegts::open_demuxer(input, &NullCodecResolver)
+    }
+}
+
+fn windowed_reader(
+    bytes: Box<dyn BytesSource>,
+    range: Option<ByteWindowSpec>,
+) -> Result<Box<dyn ReadSeek>> {
+    match range {
+        Some(range) => Ok(Box::new(ByteWindow::new(bytes, range)?)),
+        None => Ok(Box::new(SegmentReader(bytes))),
+    }
+}
+
+fn fetch_map(key: &MapKey) -> Result<Vec<u8>> {
+    if key.range.is_some_and(|range| range.length > MAX_INIT_BYTES) {
+        return Err(Error::unsupported(format!(
+            "hls: initialization map exceeds {MAX_INIT_BYTES} byte limit"
+        )));
+    }
+    let bytes = oxideav_http::open_http(key.url.as_str())?;
+    let mut input = windowed_reader(bytes, key.range)?;
+    let mut init = Vec::new();
+    input
+        .by_ref()
+        .take(MAX_INIT_BYTES + 1)
+        .read_to_end(&mut init)?;
+    if init.len() as u64 > MAX_INIT_BYTES {
+        return Err(Error::unsupported(format!(
+            "hls: initialization map exceeds {MAX_INIT_BYTES} byte limit"
+        )));
+    }
+    if init.is_empty() {
+        return Err(Error::invalid("hls: initialization map is empty"));
+    }
+    Ok(init)
 }
 
 fn stream_index_map(
@@ -759,7 +1059,7 @@ fn stream_index_map(
 ) -> Result<Vec<(u32, u32)>> {
     if expected.len() != actual.len() {
         return Err(Error::invalid(format!(
-            "hls: MPEG-TS stream count changed at segment {segment}: expected {}, got {}",
+            "hls: stream count changed at segment {segment}: expected {}, got {}",
             expected.len(),
             actual.len()
         )));
@@ -789,7 +1089,7 @@ fn stream_index_map(
             .collect::<Vec<_>>();
         if candidates.len() != 1 {
             return Err(Error::invalid(format!(
-                "hls: MPEG-TS stream layout changed ambiguously at segment {segment}: local stream {} ({:?}/{}) matched {} stable streams",
+                "hls: stream layout changed ambiguously at segment {segment}: local stream {} ({:?}/{}) matched {} stable streams",
                 actual_stream.index,
                 actual_stream.params.media_type,
                 actual_stream.params.codec_id,
@@ -799,7 +1099,7 @@ fn stream_index_map(
         let stable_index = candidates[0].index;
         if !matched_stable.insert(stable_index) {
             return Err(Error::invalid(format!(
-                "hls: MPEG-TS stream layout changed ambiguously at segment {segment}: stable stream {stable_index} matched more than once"
+                "hls: stream layout changed ambiguously at segment {segment}: stable stream {stable_index} matched more than once"
             )));
         }
         mapping.push((actual_stream.index, stable_index));
@@ -1002,8 +1302,8 @@ mod tests {
         read_counts: Arc<Vec<Arc<AtomicUsize>>>,
         failing_segment: Option<usize>,
     ) -> SegmentOpener {
-        Arc::new(move |url| {
-            let segment = segment_number(url);
+        Arc::new(move |entry| {
+            let segment = segment_number(&entry.url);
             open_counts[segment].fetch_add(1, Ordering::SeqCst);
             if failing_segment == Some(segment) {
                 return Err(Error::other(format!(
@@ -1185,6 +1485,186 @@ mod tests {
     }
 
     #[test]
+    fn index_resolves_map_reuse_changes_and_implicit_segment_ranges() {
+        use m3u8_rs::{ByteRange, Map, MediaSegment};
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let first_map = Map {
+            uri: "init.mp4".into(),
+            byte_range: Some(ByteRange {
+                length: 8,
+                offset: Some(4),
+            }),
+            ..Default::default()
+        };
+        let second_map = Map {
+            uri: "next-init.mp4".into(),
+            ..Default::default()
+        };
+        let media = MediaPlaylist {
+            end_list: true,
+            segments: vec![
+                MediaSegment {
+                    uri: "fragments.mp4".into(),
+                    duration: 2.0,
+                    byte_range: Some(ByteRange {
+                        length: 10,
+                        offset: Some(0),
+                    }),
+                    map: Some(first_map.clone()),
+                    ..Default::default()
+                },
+                MediaSegment {
+                    uri: "fragments.mp4".into(),
+                    duration: 2.0,
+                    byte_range: Some(ByteRange {
+                        length: 12,
+                        offset: None,
+                    }),
+                    map: Some(first_map),
+                    ..Default::default()
+                },
+                MediaSegment {
+                    uri: "last.mp4".into(),
+                    duration: 2.0,
+                    map: Some(second_map),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let indexed = build_segment_index(&media_url, &media).unwrap();
+        assert_eq!(indexed[0].map, indexed[1].map);
+        assert_ne!(indexed[1].map, indexed[2].map);
+        assert_eq!(indexed[0].map.as_ref().unwrap().range.unwrap().offset, 4);
+        assert_eq!(indexed[1].range.unwrap().offset, 10);
+        assert_eq!(indexed[1].range.unwrap().length, 12);
+        assert_eq!(indexed[2].range, None);
+        assert_eq!(
+            indexed[2].map.as_ref().unwrap().url.as_str(),
+            "https://example.test/vod/next-init.mp4"
+        );
+    }
+
+    #[test]
+    fn implicit_range_requires_preceding_range_on_same_uri() {
+        let url = Url::parse("https://example.test/segment.mp4").unwrap();
+        let other = Url::parse("https://example.test/other.mp4").unwrap();
+        let raw = m3u8_rs::ByteRange {
+            length: 5,
+            offset: None,
+        };
+        assert!(resolve_byte_range(&raw, None, &url, "segment").is_err());
+        assert!(resolve_byte_range(
+            &raw,
+            Some((
+                &other,
+                ByteWindowSpec {
+                    offset: 0,
+                    length: 5
+                }
+            )),
+            &url,
+            "segment"
+        )
+        .is_err());
+        assert_eq!(
+            resolve_byte_range(
+                &raw,
+                Some((
+                    &url,
+                    ByteWindowSpec {
+                        offset: 7,
+                        length: 5
+                    }
+                )),
+                &url,
+                "segment"
+            )
+            .unwrap()
+            .offset,
+            12
+        );
+    }
+
+    #[test]
+    fn byte_window_reads_only_its_range_and_seeks_locally() {
+        let source: Box<dyn BytesSource> = Box::new(io::Cursor::new(b"0123456789".to_vec()));
+        let mut window = ByteWindow::new(
+            source,
+            ByteWindowSpec {
+                offset: 3,
+                length: 4,
+            },
+        )
+        .unwrap();
+        let mut buf = [0; 8];
+        assert_eq!(window.read(&mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"3456");
+        assert_eq!(window.read(&mut buf).unwrap(), 0);
+        assert_eq!(window.seek(SeekFrom::End(-2)).unwrap(), 2);
+        assert_eq!(window.read(&mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"56");
+        assert!(window.seek(SeekFrom::End(1)).is_err());
+    }
+
+    #[test]
+    fn mapped_reader_supports_mp4_style_cross_boundary_seeks() {
+        let init = Arc::new(b"ftypmoov".to_vec());
+        let fragment: Box<dyn ReadSeek> = Box::new(io::Cursor::new(b"moofmdat".to_vec()));
+        let mut combined = InitAndSegment::new(init, fragment).unwrap();
+        assert_eq!(combined.seek(SeekFrom::End(0)).unwrap(), 16);
+        assert_eq!(combined.seek(SeekFrom::Start(6)).unwrap(), 6);
+        let mut buf = [0; 6];
+        combined.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ovmoof");
+        assert_eq!(combined.seek(SeekFrom::Current(-10)).unwrap(), 2);
+        combined.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ypmoov");
+        assert!(combined.seek(SeekFrom::Start(17)).is_err());
+    }
+
+    #[test]
+    fn initialization_map_cache_reuses_bytes_across_segments_and_seeks() {
+        let key = MapKey {
+            url: Url::parse("https://example.test/init.mp4").unwrap(),
+            range: None,
+        };
+        let cache = MapCache::default();
+        let downloads = AtomicUsize::new(0);
+        let first = cache
+            .get_or_insert_with(&key, || {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(b"initialization".to_vec())
+            })
+            .unwrap();
+        let again = cache
+            .get_or_insert_with(&key, || {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        for index in 0..MAX_CACHED_MAPS {
+            let other = MapKey {
+                url: Url::parse(&format!("https://example.test/other-{index}.mp4")).unwrap(),
+                range: None,
+            };
+            cache
+                .get_or_insert_with(&other, || Ok(vec![index as u8]))
+                .unwrap();
+        }
+        let refetched = cache
+            .get_or_insert_with(&key, || {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(b"initialization".to_vec())
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &refetched));
+        assert_eq!(downloads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn hls_scheme_unwraps_to_http() {
         assert_eq!(
             unwrap_hls_uri("hls+https://example.test/master.m3u8")
@@ -1255,6 +1735,54 @@ mod tests {
         wait_for_count(&read_counts[3], 1);
         assert_eq!(open_counts[3].load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn audio_addressed_seek_rescales_to_fmp4_video_time_base() {
+        struct TwoTrackDemuxer {
+            streams: Vec<StreamInfo>,
+            packets: VecDeque<Packet>,
+            targets: Arc<Mutex<Vec<(u32, i64)>>>,
+        }
+        impl Demuxer for TwoTrackDemuxer {
+            fn format_name(&self) -> &str {
+                "fake-fmp4"
+            }
+            fn streams(&self) -> &[StreamInfo] {
+                &self.streams
+            }
+            fn next_packet(&mut self) -> Result<Packet> {
+                self.packets.pop_front().ok_or(Error::Eof)
+            }
+            fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+                self.targets.lock().unwrap().push((stream_index, pts));
+                Ok(pts)
+            }
+        }
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let opener: SegmentOpener = {
+            let targets = Arc::clone(&targets);
+            Arc::new(move |_| {
+                let mut audio = typed_stream(0, MediaType::Audio, "aac");
+                audio.time_base = TimeBase::new(1, 48_000);
+                let video = typed_stream(1, MediaType::Video, "h264");
+                Ok(Box::new(TwoTrackDemuxer {
+                    streams: vec![audio.clone(), video.clone()],
+                    packets: VecDeque::from([
+                        Packet::new(0, audio.time_base, vec![0]).with_pts(0),
+                        Packet::new(1, video.time_base, vec![1]).with_pts(0),
+                    ]),
+                    targets: Arc::clone(&targets),
+                }))
+            })
+        };
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let mut source =
+            HlsPacketSource::open_with_opener(&media_url, &fake_media(4), opener).expect("open");
+        let audio_target = 25 * 48_000;
+        assert_eq!(source.seek_to(0, audio_target).unwrap(), audio_target);
+        assert_eq!(source.current_segment, 2);
+        assert_eq!(targets.lock().unwrap().as_slice(), &[(1, 25 * 90_000)]);
+    }
     #[test]
     fn reordered_mpegts_streams_keep_stable_hls_packet_indices() {
         let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
@@ -1262,8 +1790,8 @@ mod tests {
         let seek_stream = Arc::new(AtomicUsize::new(usize::MAX));
         let opener: SegmentOpener = {
             let seek_stream = Arc::clone(&seek_stream);
-            Arc::new(move |url| {
-                let segment = segment_number(url);
+            Arc::new(move |entry| {
+                let segment = segment_number(&entry.url);
                 let streams = if segment == 0 {
                     twitch_layout()
                 } else {
