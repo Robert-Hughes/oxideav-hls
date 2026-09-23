@@ -1,11 +1,12 @@
 //! Minimal HLS VOD source for OxideAV.
 //!
-//! VOD support covers MPEG-TS segments and mapped fMP4 fragments:
+//! VOD support covers MPEG-TS, mapped fMP4 and ID3-timestamped ADTS AAC:
 //! * HTTP(S) master or media playlists;
 //! * VOD (`#EXT-X-ENDLIST`) only;
 //! * one fixed rendition selected at open time;
 //! * MPEG-TS segments and fMP4 segments with `#EXT-X-MAP`;
 //! * optional segment and initialization-map byte ranges;
+//! * audio-rendition discovery (including embedded audio without a URI);
 //! * no encryption, discontinuities, or live reloads.
 //!
 //! `m3u8-rs` parses the playlists; `oxideav-http` performs every HTTP transfer.
@@ -16,6 +17,11 @@
 //! a media-time index, so seeking jumps directly to one segment instead of byte-
 //! bisecting a virtual concatenation of every object in a long VOD.
 
+#[cfg(test)]
+mod http_tests;
+mod packed_audio;
+mod segment;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{mpsc, Arc, Mutex};
@@ -25,8 +31,8 @@ use m3u8_rs::{
     AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
 };
 use oxideav_core::{
-    BytesSource, CancellationToken, Demuxer, Error, NullCodecResolver, Packet, PacketSource,
-    ReadSeek, Result, RuntimeContext, StreamInfo,
+    BytesSource, CancellationToken, Demuxer, Error, Packet, PacketSource, ReadSeek, Result,
+    RuntimeContext, StreamInfo,
 };
 use url::Url;
 
@@ -56,6 +62,37 @@ pub struct HlsVariant {
     pub name: Option<String>,
 }
 
+/// An `EXT-X-MEDIA:TYPE=AUDIO` rendition. Match `group_id` against a
+/// variant's `audio_group`; names are unique only within a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HlsAudioRendition {
+    pub group_id: String,
+    pub name: String,
+    /// Absolute media-playlist URL. `None` means audio is embedded in the
+    /// associated variant; callers must not open a second source in that case.
+    pub url: Option<Url>,
+    pub language: Option<String>,
+    pub assoc_language: Option<String>,
+    pub default: bool,
+    pub autoselect: bool,
+    /// Preserve the HLS channel-description string, including any suffix.
+    pub channels: Option<String>,
+    pub characteristics: Option<String>,
+}
+
+impl HlsVariant {
+    /// Renditions associated with this variant, in master-playlist order.
+    /// Selection policy (language, accessibility, default) belongs to the caller.
+    pub fn audio_renditions<'a>(
+        &'a self,
+        renditions: &'a [HlsAudioRendition],
+    ) -> impl Iterator<Item = &'a HlsAudioRendition> + 'a {
+        renditions
+            .iter()
+            .filter(|r| self.audio_group.as_deref() == Some(r.group_id.as_str()))
+    }
+}
+
 /// Result of fetching and parsing one HLS playlist for discovery.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HlsPlaylistInfo {
@@ -67,6 +104,8 @@ pub enum HlsPlaylistInfo {
     Master {
         variants: Vec<HlsVariant>,
         preferred_variant: usize,
+        /// All audio groups; use `HlsVariant::audio_renditions` to find matches.
+        audio_renditions: Vec<HlsAudioRendition>,
     },
 }
 
@@ -180,6 +219,16 @@ fn inspect_master(master_url: &Url, master: &MasterPlaylist) -> Result<HlsPlayli
         ))
     })?;
     let variants = inspect_variants(master_url, master)?;
+    let audio_renditions = inspect_audio_renditions(master_url, master)?;
+    for variant in &variants {
+        if let Some(group) = &variant.audio_group {
+            if variant.audio_renditions(&audio_renditions).next().is_none() {
+                return Err(Error::invalid(format!(
+                    "hls: variant references missing audio group {group:?}"
+                )));
+            }
+        }
+    }
     let preferred_variant = variants
         .iter()
         .position(|variant| variant.url == preferred_url)
@@ -189,7 +238,46 @@ fn inspect_master(master_url: &Url, master: &MasterPlaylist) -> Result<HlsPlayli
     Ok(HlsPlaylistInfo::Master {
         variants,
         preferred_variant,
+        audio_renditions,
     })
+}
+
+fn inspect_audio_renditions(
+    master_url: &Url,
+    master: &MasterPlaylist,
+) -> Result<Vec<HlsAudioRendition>> {
+    master
+        .alternatives
+        .iter()
+        .filter(|r| r.media_type == AlternativeMediaType::Audio)
+        .map(|r| {
+            let url = r
+                .uri
+                .as_ref()
+                .map(|uri| {
+                    if uri.is_empty() {
+                        return Err(Error::invalid("hls: empty audio rendition URI"));
+                    }
+                    let url = master_url.join(uri).map_err(|e| {
+                        Error::invalid(format!("hls: invalid audio rendition URI: {e}"))
+                    })?;
+                    require_http(&url, "audio rendition")?;
+                    Ok(url)
+                })
+                .transpose()?;
+            Ok(HlsAudioRendition {
+                group_id: r.group_id.clone(),
+                name: r.name.clone(),
+                url,
+                language: r.language.clone(),
+                assoc_language: r.assoc_language.clone(),
+                default: r.default,
+                autoselect: r.autoselect,
+                channels: r.channels.clone(),
+                characteristics: r.characteristics.clone(),
+            })
+        })
+        .collect()
 }
 
 fn inspect_variants(master_url: &Url, master: &MasterPlaylist) -> Result<Vec<HlsVariant>> {
@@ -580,10 +668,11 @@ struct HlsPacketSource {
 impl HlsPacketSource {
     fn open(media_url: &Url, media: &MediaPlaylist) -> Result<Self> {
         let maps = Arc::new(MapCache::default());
+        let audio_timeline = packed_audio::Timeline::default();
         Self::open_with_opener(
             media_url,
             media,
-            Arc::new(move |segment| open_segment_demuxer(segment, &maps)),
+            Arc::new(move |segment| open_segment_demuxer(segment, &maps, &audio_timeline)),
         )
     }
 
@@ -996,25 +1085,19 @@ fn segment_index_for_media_seconds(segments: &[SegmentEntry], seconds: f64) -> u
     insertion.saturating_sub(1).min(segments.len() - 1)
 }
 
-fn open_segment_demuxer(segment: &SegmentEntry, maps: &MapCache) -> Result<Box<dyn Demuxer>> {
+fn open_segment_demuxer(
+    segment: &SegmentEntry,
+    maps: &MapCache,
+    audio_timeline: &packed_audio::Timeline,
+) -> Result<Box<dyn Demuxer>> {
     let bytes = oxideav_http::open_http(segment.url.as_str())?;
     let input = windowed_reader(bytes, segment.range)?;
     if let Some(map) = &segment.map {
         let init = maps.get_or_fetch(map)?;
-        let is_mp4 = init.get(4..8) == Some(b"ftyp") || init.get(4..8) == Some(b"moov");
-        let is_ts = init.first() == Some(&0x47);
         let combined: Box<dyn ReadSeek> = Box::new(InitAndSegment::new(init, input)?);
-        if is_mp4 {
-            oxideav_mp4::demux::open(combined, &NullCodecResolver)
-        } else if is_ts {
-            oxideav_mpegts::open_demuxer(combined, &NullCodecResolver)
-        } else {
-            Err(Error::unsupported(
-                "hls: EXT-X-MAP initialization data is neither fMP4 nor MPEG-TS",
-            ))
-        }
+        segment::open(combined, true, audio_timeline, segment.start_seconds)
     } else {
-        oxideav_mpegts::open_demuxer(input, &NullCodecResolver)
+        segment::open(input, false, audio_timeline, segment.start_seconds)
     }
 }
 
@@ -1430,6 +1513,7 @@ mod tests {
         let HlsPlaylistInfo::Master {
             variants,
             preferred_variant,
+            ..
         } = inspect_master(&master_url, &master).unwrap()
         else {
             panic!("expected master inspection");

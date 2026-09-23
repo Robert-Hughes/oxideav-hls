@@ -4,18 +4,20 @@ Minimal HLS VOD packet-source integration for the OxideAV framework.
 
 The crate deliberately keeps HLS as a **source-layer concern**. It resolves a
 master/media playlist, opens each segment through `oxideav-http`, and
-owns its MPEG-TS or MP4 demuxer. Downstream OxideAV code sees one
+owns the selected segment demuxer. Downstream OxideAV code sees one
 continuous `PacketSource`; it does not need to know where HLS segment
 boundaries occur.
 
 ## Current scope
 
-The implementation targets completed VOD playlists with MPEG-TS or fMP4 media:
+The implementation targets completed VOD playlists:
 
 - HTTP(S) master or media playlists;
 - completed VOD/event playlists carrying `#EXT-X-ENDLIST`;
 - one fixed rendition selected when the source opens;
 - MPEG-TS segments and mapped fragmented MP4 segments;
+- ID3-timestamped packed ADTS AAC, detected from content rather than URL suffix;
+- discovery of external and embedded audio renditions and their variant groups;
 - relative playlist/segment URI resolution;
 - `#EXTINF`-indexed media-time seeking;
 - one-segment successor readahead;
@@ -41,7 +43,10 @@ hls+https://...
 
 The extra `hls+` prefix makes HLS source selection explicit. Playlist and
 segment transfers are delegated to `oxideav-http`, while MPEG-TS demuxing is
-delegated to `oxideav-mpegts` and fMP4 demuxing to `oxideav-mp4`.
+delegated to `oxideav-mpegts` and fMP4 demuxing to `oxideav-mp4`. Packed AAC
+headers are parsed by `oxideav-aac::adts::AdtsHeader`. HLS handles the ID3 transport
+anchor and packet timing; compressed ADTS frames (including their headers/CRC)
+are passed unchanged to the decoder.
 
 ## Rendition selection
 
@@ -63,6 +68,73 @@ segment itself.
 This is fixed-rendition selection. Adaptive bitrate selection is not provided
 by this crate.
 
+### Audio rendition discovery
+
+`HlsPlaylistInfo::Master::audio_renditions` contains every `TYPE=AUDIO`
+`EXT-X-MEDIA` entry, in playlist order. Each `HlsAudioRendition` retains its
+group/name, absolute optional URL, language and associated language, default and
+autoselect flags, channels string and accessibility characteristics. A variant's
+`audio_renditions(&audio_renditions)` iterator matches its `AUDIO` group ID.
+Names are not globally unique: two groups may both have an "English" rendition.
+
+An absent rendition URL means audio is embedded in the associated variant; it
+does **not** mean an invalid or missing playlist. An external URL can be opened
+with `open_hls("hls+https://...")` and routed alongside the video URL in an
+OxideAV pipeline job. Discovery does not fetch rendition playlists and leaves
+language/default/accessibility selection to the application. Opening the master
+with `open_hls` still opens only the selected variant; it does not automatically
+merge external audio. This API addition requires exhaustive `Master` patterns
+to bind `audio_renditions` or include `..`.
+
+### Segment format and packed-audio timing
+
+The segment dispatcher probes the bytes after applying any byte range and
+initialization map. MPEG-TS and mapped fMP4 use their existing demuxers. An ID3
+prefix selects the packed-audio reader. Unknown formats, unmapped fMP4 and
+packed audio with a map fail explicitly instead of falling through to MPEG-TS.
+
+Packed AAC follows [RFC 8216 section 3.4](https://www.rfc-editor.org/rfc/rfc8216#section-3.4):
+each segment must begin with an ID3 PRIV transport timestamp identifying its
+first sample. ID3v2.3 and ID3v2.4 sizes, extended headers, unsynchronisation and
+v2.4 footers are handled. Unrelated metadata is skipped, including ID3 tags
+between AAC frames; missing/invalid timestamps and compressed/encrypted PRIV
+frames fail explicitly. Metadata reads are bounded to 1 MiB per scan.
+
+Packets use the shared 90 kHz transport time base. Each PTS is calculated from
+the ID3 anchor plus cumulative samples at the ADTS core sample rate, avoiding
+per-frame rounding drift (including 44.1 kHz). The playlist's segment position
+resolves 33-bit timestamp wraparound against the first segment; seeking and
+out-of-order readahead therefore use the same clock epoch. Seeking scans only
+the chosen segment and lands on an AAC frame at or before the target, clamping
+to its first frame when necessary. ADTS configuration changes within a segment
+or between packed-audio segments are rejected because the source advertises a
+fixed stream description. Channel configuration zero remains unknown until the
+decoder reads the in-band Program Config Element.
+
+Other HLS packed-audio codecs (MP3, AC-3, E-AC-3) and WebVTT segments are not
+implemented. Their framing/timing adapters can be added at the segment dispatch
+boundary without changes to playlist traversal or the playback pipeline.
+
+### Validation
+
+`cargo test` covers playlist discovery, content-based dispatch, metadata parsing,
+sample timing, transport wraparound, frame seeks, and a local HTTP VOD with
+byte-ranged segments and successor readahead. `cargo clippy --all-targets -- -D
+warnings` checks the library and tests.
+
+An optional real-source smoke test reads 600 packets, decodes the first 20 with
+the existing AAC decoder, seeks to 60 seconds, and opens the video rendition:
+
+```text
+# Set OXIDEAV_TEST_HLS_MASTER to a fresh hls+https:// master URI with external AAC.
+cargo test --test live_audio -- --ignored --nocapture
+```
+
+It produces no audible output and does not save media or signed URLs. Origins
+that answer range probes with full HTTP 200 responses require the corresponding
+`oxideav-http` full-response fallback. Local validation used that existing
+implementation (`25e6869`) through Cargo path overrides.
+
 ## Why playlist fetches use normal GET
 
 `oxideav-http::open_http()` is a seekable media source and normally probes the
@@ -82,7 +154,7 @@ resolved segment URLs, optional byte ranges and initialization maps, and
 
 `HlsPacketSource` owns:
 
-- the active MPEG-TS or MP4 demuxer for the current segment;
+- the active demuxer for the current segment;
 - the stream metadata exposed to downstream consumers;
 - the playlist-duration/media-time segment index;
 - a small queue of packets primed during startup or successor preparation; and
@@ -111,7 +183,7 @@ Exactly one successor segment is prepared in the background.
 While segment N is active, a worker for segment N+1:
 
 1. opens the segment's HTTP resource;
-2. creates its MPEG-TS or MP4 demuxer;
+2. detects the segment format and creates its demuxer;
 3. validates that its stream layout matches the current rendition; and
 4. primes the first packet.
 
