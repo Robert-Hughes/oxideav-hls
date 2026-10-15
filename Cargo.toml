@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/Robert-Hughes/oxideav-hls"
-description = "HLS VOD source driver for OxideAV"
+description = "HLS VOD and live/event source driver for OxideAV"
 
 [dependencies]
 log = "0.4"

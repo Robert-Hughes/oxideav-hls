@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct Origin {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,
+    files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -22,6 +23,8 @@ impl Origin {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
+        let files = Arc::new(Mutex::new(files));
+        let served = files.clone();
         let worker = thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -57,7 +60,8 @@ impl Origin {
                         }
                     }
                 }
-                let Some(body) = files.get(&path) else {
+                let body = served.lock().unwrap().get(&path).cloned();
+                let Some(body) = body else {
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                     );
@@ -92,12 +96,16 @@ impl Origin {
         Self {
             url,
             requests,
+            files,
             stop,
             worker: Some(worker),
         }
     }
     fn hls(&self, path: &str) -> String {
         format!("hls+{}{path}", self.url)
+    }
+    fn set(&self, path: &str, body: impl Into<Vec<u8>>) {
+        self.files.lock().unwrap().insert(path.into(), body.into());
     }
 }
 
@@ -253,4 +261,73 @@ fn packed_aac_http_ranges_boundaries_wrap_and_repeated_seeks() {
             Err(error) => panic!("failed to drain final segment: {error}"),
         }
     }
+}
+
+#[test]
+fn live_playlist_reloads_sliding_window_and_finishes_at_endlist() {
+    use std::time::Duration;
+    let a = segment(0, 3, 2);
+    let b = segment(3840, 3, 2);
+    let first =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXTINF:0.042666667,\na.aac\n";
+    let second =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:8\n#EXTINF:0.042666667,\nb.aac\n";
+    let origin = Origin::new(HashMap::from([
+        ("/live.m3u8".into(), first.as_bytes().to_vec()),
+        ("/a.aac".into(), a),
+        ("/b.aac".into(), b),
+    ]));
+    let mut source = open_hls(&origin.hls("/live.m3u8")).unwrap();
+    assert_eq!(source.duration_micros(), None);
+    assert!(
+        source
+            .streams()
+            .iter()
+            .all(|stream| stream.duration.is_none()),
+        "growing streams must not advertise a fixed duration"
+    );
+    assert_eq!(source.next_packet().unwrap().pts, Some(0));
+    assert_eq!(source.next_packet().unwrap().pts, Some(1920));
+    assert!(source.poll_next_packet().unwrap().is_none());
+
+    // New playlist drops the consumed segment and appends the next one.
+    origin.set("/live.m3u8", second);
+    let mut packet_pts = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while packet_pts.len() < 2 && std::time::Instant::now() < deadline {
+        match source.poll_next_packet() {
+            Ok(Some(packet)) => packet_pts.push(packet.pts),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => panic!("reload: {error}"),
+        }
+    }
+    assert_eq!(packet_pts, [Some(3840), Some(5760)]);
+    assert!(source.poll_next_packet().unwrap().is_none());
+
+    // The final playlist contains no new segments: ENDLIST alone must
+    // transition to true EOF, without repeating any existing packet.
+    origin.set("/live.m3u8", format!("{second}#EXT-X-ENDLIST\n"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut reached_eof = false;
+    while std::time::Instant::now() < deadline {
+        match source.poll_next_packet() {
+            Err(Error::Eof) => {
+                reached_eof = true;
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(Some(packet)) => panic!("unexpected duplicate packet {:?}", packet.pts),
+            Err(error) => panic!("final reload: {error}"),
+        }
+    }
+    assert!(reached_eof, "playlist never reached ENDLIST");
+    assert_eq!(source.duration_micros(), Some(85_333));
+    let media_requests = origin
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.contains("/live.m3u8"))
+        .count();
+    assert!(media_requests >= 3, "should reload playlist twice");
 }

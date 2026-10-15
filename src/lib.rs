@@ -1,21 +1,22 @@
-//! Minimal HLS VOD source for OxideAV.
+//! HLS VOD, growing EVENT and sliding live playlist source for OxideAV.
 //!
-//! VOD support covers MPEG-TS, mapped fMP4 and ID3-timestamped ADTS AAC:
+//! Supported media includes MPEG-TS, mapped fMP4 and ID3-timestamped ADTS AAC:
 //! * HTTP(S) master or media playlists;
-//! * VOD (`#EXT-X-ENDLIST`) only;
+//! * completed VOD (`#EXT-X-ENDLIST`) and actively reloaded playlists;
 //! * one fixed rendition selected at open time;
 //! * MPEG-TS segments and fMP4 segments with `#EXT-X-MAP`;
 //! * optional segment and initialization-map byte ranges;
 //! * audio-rendition discovery (including embedded audio without a URI);
-//! * no encryption, discontinuities, or live reloads.
+//! * no encryption or discontinuities.
 //!
-//! `m3u8-rs` parses the playlists; `oxideav-http` performs every HTTP transfer.
-//! The source exposes already-demuxed packets while owning the active segment
-//! demuxer plus one HLS-local successor readahead. The successor is opened on a
-//! background thread and primed through its first packet so HTTP setup and initial
-//! demux work overlap playback of the current segment. `#EXTINF` durations provide
-//! a media-time index, so seeking jumps directly to one segment instead of byte-
-//! bisecting a virtual concatenation of every object in a long VOD.
+//! `m3u8-rs` parses playlists; `oxideav-http` performs HTTP transfers.
+//! The packet source owns its active segment demuxer, and overlaps the next
+//! segment's HTTP/demux setup through bounded successor readahead. Playlist
+//! reloads run on a separate worker so `poll_next_packet` returns promptly
+//! when a growing stream reaches its currently published edge, permitting
+//! pipeline seeks and cancellation while awaiting new media. Segment media
+//! sequence numbers prevent duplicate delivery across sliding playlists.
+//! `#EXTINF` durations index available media for segment-based seeking.
 
 #[cfg(test)]
 mod http_tests;
@@ -26,6 +27,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use m3u8_rs::{
     AlternativeMediaType, KeyMethod, MasterPlaylist, MediaPlaylist, Playlist, VariantStream,
@@ -387,11 +389,6 @@ fn select_variant(variants: &[VariantStream]) -> Result<&VariantStream> {
 }
 
 fn validate_media_playlist(media: &MediaPlaylist) -> Result<()> {
-    if !media.end_list {
-        return Err(Error::unsupported(
-            "hls: live/event playlist reloads are not supported in V1 (missing #EXT-X-ENDLIST)",
-        ));
-    }
     if media.i_frames_only {
         return Err(Error::unsupported(
             "hls: I-frames-only playlists are not supported",
@@ -652,6 +649,15 @@ struct SegmentReadahead {
     receiver: mpsc::Receiver<Result<PreparedSegment>>,
 }
 
+struct LivePlaylist {
+    url: Url,
+    first_sequence: u64,
+    last_sequence: u64,
+    next_reload: Instant,
+    interval: Duration,
+    pending_reload: Option<mpsc::Receiver<Result<Playlist>>>,
+    consecutive_errors: u8,
+}
 struct HlsPacketSource {
     segments: Vec<SegmentEntry>,
     total_duration_seconds: f64,
@@ -663,6 +669,7 @@ struct HlsPacketSource {
     pending: VecDeque<Packet>,
     segment_opener: SegmentOpener,
     readahead: Option<SegmentReadahead>,
+    live: Option<LivePlaylist>,
 }
 
 impl HlsPacketSource {
@@ -729,10 +736,21 @@ impl HlsPacketSource {
             })
             .ok_or_else(|| Error::invalid("hls: first segment exposed no timestamped packets"))?;
 
-        for stream in &mut streams {
-            let tick_seconds = stream.time_base.as_rational().as_f64();
-            if tick_seconds.is_finite() && tick_seconds > 0.0 {
-                stream.duration = Some((total_duration_seconds / tick_seconds).round() as i64);
+        // A growing playlist's advertised segments are not its final duration.
+        // Publishing the current window as a fixed StreamInfo duration makes
+        // consumers clamp their playback clock at the original live edge.
+        if media.end_list {
+            for stream in &mut streams {
+                let tick_seconds = stream.time_base.as_rational().as_f64();
+                if tick_seconds.is_finite() && tick_seconds > 0.0 {
+                    stream.duration = Some((total_duration_seconds / tick_seconds).round() as i64);
+                }
+            }
+        } else {
+            // The first physical segment may advertise its own local duration;
+            // this is not the duration of the growing HLS presentation.
+            for stream in &mut streams {
+                stream.duration = None;
             }
         }
 
@@ -758,11 +776,154 @@ impl HlsPacketSource {
             pending,
             segment_opener,
             readahead: None,
+            live: (!media.end_list).then(|| LivePlaylist {
+                url: media_url.clone(),
+                first_sequence: media.media_sequence,
+                last_sequence: media.media_sequence,
+                next_reload: Instant::now(),
+                interval: Duration::from_secs(media.target_duration.max(1)),
+                pending_reload: None,
+                consecutive_errors: 0,
+            }),
         };
+        if source.live.is_some() {
+            log::info!("oxideav-hls: growing playlist opened first_sequence={} segments={} available_duration={:.3}s target_duration={}s", media.media_sequence, source.segments.len(), source.total_duration_seconds, media.target_duration);
+        }
         source.start_readahead();
         Ok(source)
     }
 
+    /// Start an HTTP reload on a background worker and consume completed
+    /// results without blocking the packet-source control loop. The pipeline
+    /// must remain able to handle seek and stop while no segments are available.
+    fn reload_live(&mut self) -> Result<()> {
+        let Some(live) = self.live.as_mut() else {
+            return Ok(());
+        };
+        let completed = match live.pending_reload.take() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => {
+                    live.pending_reload = Some(receiver);
+                    return Ok(());
+                }
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(Error::other(
+                    "hls: playlist reload worker terminated unexpectedly",
+                ))),
+            },
+            None => None,
+        };
+        if let Some(result) = completed {
+            let playlist = match result {
+                Ok(playlist) => {
+                    live.consecutive_errors = 0;
+                    playlist
+                }
+                Err(error) => {
+                    live.consecutive_errors = live.consecutive_errors.saturating_add(1);
+                    if live.consecutive_errors >= 5 {
+                        return Err(Error::other(format!(
+                            "hls: playlist reload failed {} consecutive times: {error}",
+                            live.consecutive_errors
+                        )));
+                    }
+                    let backoff = live
+                        .interval
+                        .saturating_mul(1 << live.consecutive_errors.min(4))
+                        .min(Duration::from_secs(30));
+                    live.next_reload = Instant::now() + backoff;
+                    log::warn!(
+                        "oxideav-hls: playlist reload failure {}/5; retry in {:?}: {error}",
+                        live.consecutive_errors,
+                        backoff
+                    );
+                    return Ok(());
+                }
+            };
+            let Playlist::MediaPlaylist(media) = playlist else {
+                return Err(Error::invalid("hls: media playlist changed to master"));
+            };
+            validate_media_playlist(&media)?;
+            if media.media_sequence < live.last_sequence {
+                return Err(Error::invalid(
+                    "hls: live playlist media sequence regressed",
+                ));
+            }
+            let old_end = live
+                .first_sequence
+                .checked_add(self.segments.len() as u64)
+                .ok_or_else(|| Error::invalid("hls: segment sequence overflow"))?;
+            let new_end = media
+                .media_sequence
+                .checked_add(media.segments.len() as u64)
+                .ok_or_else(|| Error::invalid("hls: segment sequence overflow"))?;
+            if media.media_sequence > old_end {
+                return Err(Error::invalid(format!(
+                    "hls: live playlist skipped segments: expected {old_end}, now starts at {}",
+                    media.media_sequence
+                )));
+            }
+            if new_end < old_end {
+                return Err(Error::invalid("hls: live playlist segment count regressed"));
+            }
+            let changed = new_end > old_end;
+            if changed {
+                let fresh = build_segment_index(&live.url, &media)?;
+                let first = (old_end - media.media_sequence) as usize;
+                let mut elapsed = self.total_duration_seconds;
+                for mut entry in fresh.into_iter().skip(first) {
+                    entry.start_seconds = elapsed;
+                    elapsed += entry.duration_seconds;
+                    self.segments.push(entry);
+                }
+                self.total_duration_seconds = elapsed;
+            }
+            if changed {
+                log::info!("oxideav-hls: playlist advanced sequence={}..{} added={} indexed_segments={} duration={:.3}s", old_end, new_end, new_end - old_end, self.segments.len(), self.total_duration_seconds);
+            } else {
+                log::debug!(
+                    "oxideav-hls: playlist unchanged sequence={}..{} target_duration={}s",
+                    media.media_sequence,
+                    new_end,
+                    media.target_duration
+                );
+            }
+            live.last_sequence = media.media_sequence;
+            live.interval = Duration::from_secs(media.target_duration.max(1));
+            live.next_reload = Instant::now()
+                + if changed {
+                    live.interval
+                } else {
+                    (live.interval / 2).max(Duration::from_millis(500))
+                };
+            if media.end_list {
+                log::info!("oxideav-hls: playlist reached ENDLIST final_sequence={} indexed_segments={} duration={:.3}s", new_end, self.segments.len(), self.total_duration_seconds);
+                self.live = None;
+            }
+            if changed {
+                self.start_readahead();
+            }
+            return Ok(());
+        }
+        if Instant::now() < live.next_reload {
+            return Ok(());
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let url = live.url.clone();
+        log::debug!(
+            "oxideav-hls: starting playlist reload next_expected_sequence={} target_interval={:?}",
+            live.first_sequence + self.segments.len() as u64,
+            live.interval
+        );
+        thread::Builder::new()
+            .name("oxideav-hls-playlist-reload".into())
+            .spawn(move || {
+                let _ = sender.send(fetch_playlist(&url));
+            })
+            .map_err(|error| Error::other(format!("hls: spawn playlist reload worker: {error}")))?;
+        live.pending_reload = Some(receiver);
+        Ok(())
+    }
     fn open_segment(&self, index: usize) -> Result<Box<dyn Demuxer>> {
         (self.segment_opener)(&self.segments[index])
     }
@@ -886,8 +1047,16 @@ impl PacketSource for HlsPacketSource {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
+            match self.poll_next_packet()? {
+                Some(p) => return Ok(p),
+                None => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+    fn poll_next_packet(&mut self) -> Result<Option<Packet>> {
+        loop {
             if let Some(packet) = self.pending.pop_front() {
-                return Ok(packet);
+                return Ok(Some(packet));
             }
             match self.current.next_packet() {
                 Ok(mut packet) => {
@@ -896,12 +1065,19 @@ impl PacketSource for HlsPacketSource {
                         &self.current_stream_map,
                         self.current_segment,
                     )?;
-                    return Ok(packet);
+                    return Ok(Some(packet));
                 }
                 Err(Error::Eof) => {
                     let next = self.current_segment + 1;
                     if next >= self.segments.len() {
-                        return Err(Error::Eof);
+                        self.reload_live()?;
+                        if next >= self.segments.len() {
+                            return if self.live.is_some() {
+                                Ok(None)
+                            } else {
+                                Err(Error::Eof)
+                            };
+                        }
                     }
                     let prepared = self.take_prepared_segment(next)?;
                     self.install_prepared_segment(prepared)?;
@@ -972,7 +1148,11 @@ impl PacketSource for HlsPacketSource {
     }
 
     fn duration_micros(&self) -> Option<i64> {
-        Some((self.total_duration_seconds * 1_000_000.0).round() as i64)
+        if self.live.is_some() {
+            None
+        } else {
+            Some((self.total_duration_seconds * 1_000_000.0).round() as i64)
+        }
     }
 }
 
