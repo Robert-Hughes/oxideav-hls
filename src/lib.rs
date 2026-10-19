@@ -958,14 +958,25 @@ impl HlsPacketSource {
         }
     }
 
-    fn take_prepared_segment(&mut self, index: usize) -> Result<PreparedSegment> {
-        if let Some(readahead) = self.readahead.take() {
+    fn poll_prepared_segment(&mut self, index: usize) -> Result<Option<PreparedSegment>> {
+        if let Some(readahead) = self.readahead.as_ref() {
             if readahead.index == index {
-                return readahead.receiver.recv().map_err(|error| {
-                    Error::other(format!(
-                        "hls: segment {index} readahead worker ended without a result: {error}"
-                    ))
-                })?;
+                // The pipeline needs to poll for cancellation while a successor
+                // segment is downloading. A blocking recv() here prevents an
+                // executor abort from completing, freezing synchronous teardown.
+                match readahead.receiver.try_recv() {
+                    Ok(result) => {
+                        self.readahead = None;
+                        return result.map(Some);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return Ok(None),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.readahead = None;
+                        return Err(Error::other(format!(
+                            "hls: segment {index} readahead worker ended without a result"
+                        )));
+                    }
+                }
             }
         }
 
@@ -975,6 +986,7 @@ impl HlsPacketSource {
             self.streams.clone(),
             Arc::clone(&self.segment_opener),
         )
+        .map(Some)
     }
 
     fn install_segment(&mut self, index: usize, demuxer: Box<dyn Demuxer>) -> Result<()> {
@@ -1079,7 +1091,9 @@ impl PacketSource for HlsPacketSource {
                             };
                         }
                     }
-                    let prepared = self.take_prepared_segment(next)?;
+                    let Some(prepared) = self.poll_prepared_segment(next)? else {
+                        return Ok(None);
+                    };
                     self.install_prepared_segment(prepared)?;
                 }
                 Err(error) => return Err(error),
@@ -1935,6 +1949,128 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://example.test/master.m3u8"
+        );
+    }
+    #[test]
+    fn stalled_successor_readahead_does_not_block_packet_poll() {
+        // The pipeline's source worker checks its abort token between polls.
+        // A slow HLS segment opener must not trap that worker inside poll_next_packet.
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let reads = read_counters(2);
+        let opened_successor = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_successor = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered = Arc::clone(&opened_successor);
+        let release = Arc::clone(&release_successor);
+        let reads_for_opener = Arc::clone(&reads);
+        let opener: SegmentOpener = Arc::new(move |entry| {
+            let index = segment_number(&entry.url);
+            if index == 1 {
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(Box::new(FakeDemuxer::new(
+                index,
+                Arc::clone(&reads_for_opener[index]),
+            )))
+        });
+        let mut source =
+            HlsPacketSource::open_with_opener(&media_url, &fake_media(2), opener).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !opened_successor.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "readahead worker never started");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(source.poll_next_packet().unwrap().unwrap().data, vec![0, 0]);
+        assert_eq!(source.poll_next_packet().unwrap().unwrap().data, vec![0, 1]);
+
+        // Bounded test: unblock the fake HTTP worker even if polling hangs.
+        // Before the fix, this poll blocks until that release and returns a packet.
+        let unblock = Arc::clone(&release_successor);
+        let release_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            unblock.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let pending = source.poll_next_packet().unwrap();
+        let elapsed = started.elapsed();
+        release_thread.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "poll_next_packet blocked for {elapsed:?} waiting for successor; executor abort cannot run"
+        );
+        assert!(
+            pending.is_none(),
+            "unfinished readahead must return Pending, not a packet"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(packet) = source.poll_next_packet().unwrap() {
+                assert_eq!(packet.data, vec![1, 0]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completed readahead never delivered"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn stalled_readahead_allows_packet_worker_to_observe_abort() {
+        // Simulate the source stage's poll/abort loop with an HLS successor
+        // download that never completes until the test explicitly releases it.
+        let media_url = Url::parse("https://example.test/vod/index.m3u8").unwrap();
+        let reads = read_counters(2);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_for_opener = Arc::clone(&release);
+        let started_for_opener = Arc::clone(&started);
+        let opener: SegmentOpener = Arc::new(move |entry| {
+            let index = segment_number(&entry.url);
+            if index == 1 {
+                started_for_opener.store(true, Ordering::SeqCst);
+                while !release_for_opener.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(Box::new(FakeDemuxer::new(index, Arc::clone(&reads[index]))))
+        });
+        let mut source =
+            HlsPacketSource::open_with_opener(&media_url, &fake_media(2), opener).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "readahead worker never started");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(source.poll_next_packet().unwrap().unwrap().data, vec![0, 0]);
+        assert_eq!(source.poll_next_packet().unwrap().unwrap().data, vec![0, 1]);
+
+        let cancellation = CancellationToken::new();
+        let worker_cancel = cancellation.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            while !worker_cancel.is_cancelled() {
+                let _ = source.poll_next_packet();
+                thread::sleep(Duration::from_millis(1));
+            }
+            done_tx.send(()).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        cancellation.cancel();
+        let aborted = done_rx.recv_timeout(Duration::from_millis(200)).is_ok();
+        // Always release the synthetic HTTP request before joining, including
+        // when testing the original (broken) implementation.
+        release.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        assert!(
+            aborted,
+            "packet worker could not observe abort while waiting for HLS readahead"
         );
     }
     #[test]
