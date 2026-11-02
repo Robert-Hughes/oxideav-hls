@@ -189,23 +189,28 @@ extend beyond its nominal boundary. There is no configurable global byte
 budget: high-bitrate renditions naturally occupy more memory. A separate
 128 MiB per-segment safety ceiling rejects unexpectedly large resources.
 
-A dedicated worker fetches successive complete segments independently of
-packet queue and decoder backpressure. Byte-range segments are cached using
-their selected range, not the entire containing resource. Cache keys include
-the absolute URL and optional byte range. Initialization-map caching remains
-independent.
+A background worker fills **current and future** segments, nearest first,
+then downloads missing **historical** segments, nearest first. These priorities
+share one worker; they do not require a separate backward-fetching thread.
+Downloads are independent of decoded packet/frame backpressure. Byte-range
+segments use their selected range, not the whole containing resource. Cache
+keys include the absolute URL and optional byte range. Initialization-map
+caching remains independent.
 
-The active demuxer uses cached bytes when available. On a miss it retains
-the original streaming HTTP path, so first-frame startup and out-of-window
-seeks do not require a complete segment download. Once background prefetch
-finishes, subsequent openings and backward seeks reuse those bytes.
-The successor preparation worker waits for that cached download instead of
-launching a competing transfer. If prefetch fails, it falls back to streaming.
+**Every media-segment request flows through the cache**, including startup,
+ordinary playback and seeks. A miss creates an in-flight entry and starts a
+foreground download immediately; other readers and the background worker
+reuse that same entry. Incoming chunks become readable while the download
+continues, so MPEG-TS playback does not need to wait for the complete segment.
+A seek within an already downloaded segment reads its retained bytes without
+HTTP. Demuxers requiring the full resource length can still wait for EOF.
+The successor-readahead worker prepares the next demuxer and first packet,
+but does not own a separate network download path.
 
-Distant seeks cancel obsolete whole-segment downloads and move the window.
-Segments outside the new window are evicted. Dropping the source stops the
-worker without synchronously joining a stalled transfer. Whole-segment HTTP
-requests are cancellable; byte-range streaming checks cancellation between reads.
+Distant seeks cancel entries outside the new window. Dropping the source
+cancels its entries without synchronously joining stalled network workers.
+HTTP reader cancellation is checked between blocking reads, and waiting
+cache readers are woken immediately when an entry is cancelled.
 
 Use open_hls_with_config(uri, HlsCacheConfig { backward, forward }) to set
 per-instance windows. Registered HLS sources and open_hls() use defaults.
@@ -221,7 +226,7 @@ Exactly one successor segment is prepared in the background.
 
 While segment N is active, a worker for segment N+1:
 
-1. waits for the same segment cache prefetch, falling back to streaming if it fails;
+1. opens a reader on the shared in-flight or complete cache entry;
 2. detects the segment format and creates its demuxer;
 3. validates that its stream layout matches the current rendition; and
 4. primes the first packet.

@@ -695,7 +695,7 @@ impl HlsPacketSource {
             media_url,
             media,
             Arc::new(move |segment| {
-                open_segment_demuxer(segment, &maps, &audio_timeline, Some(&cache_for_open))
+                open_segment_demuxer(segment, &maps, &audio_timeline, &cache_for_open)
             }),
             false,
         );
@@ -984,19 +984,10 @@ impl HlsPacketSource {
         let segment = self.segments[index].clone();
         let expected_streams = self.streams.clone();
         let opener = Arc::clone(&self.segment_opener);
-        let cache = self.cache.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(format!("oxideav-hls-readahead-{index}"))
             .spawn(move || {
-                if let Some(cache) = &cache {
-                    // Segment bytes have one prefetch owner. Await them here
-                    // before opening a demuxer, avoiding duplicate requests.
-                    if let Err(error) = cache.wait_for_prefetch(&segment) {
-                        let _ = sender.send(Err(error));
-                        return;
-                    }
-                }
                 let result = prepare_segment(index, segment, expected_streams, opener);
                 let _ = sender.send(result);
             });
@@ -1355,16 +1346,11 @@ fn open_segment_demuxer(
     segment: &SegmentEntry,
     maps: &MapCache,
     audio_timeline: &packed_audio::Timeline,
-    cache: Option<&cache::SegmentCache>,
+    cache: &cache::SegmentCache,
 ) -> Result<Box<dyn Demuxer>> {
-    let input = if let Some(reader) =
-        cache.and_then(|cache| cache::cached_segment_reader(cache, segment))
-    {
-        reader
-    } else {
-        let bytes = oxideav_http::open_http(segment.url.as_str())?;
-        windowed_reader(bytes, segment.range)?
-    };
+    // Every media-segment access participates in the cache, even on a miss.
+    // The reader consumes arriving bytes without awaiting download completion.
+    let input = cache.reader(segment);
     if let Some(map) = &segment.map {
         let init = maps.get_or_fetch(map)?;
         let combined: Box<dyn ReadSeek> = Box::new(InitAndSegment::new(init, input)?);

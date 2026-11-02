@@ -280,7 +280,7 @@ fn completed_segment_cache_serves_backward_seeks_without_new_http_requests() {
             .unwrap();
     let deadline = Instant::now() + Duration::from_secs(4);
     let cache = source.cache.as_ref().unwrap();
-    while (0..3).any(|i| cache.get(&source.segments[i]).is_none()) {
+    while (0..3).any(|i| !cache.completed(&source.segments[i])) {
         assert!(Instant::now() < deadline, "prefetch did not complete");
         thread::sleep(Duration::from_millis(5));
     }
