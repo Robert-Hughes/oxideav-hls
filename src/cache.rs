@@ -167,6 +167,17 @@ struct State {
     stopped: bool,
     hits: u64,
     misses: u64,
+    completed_hits: u64,
+    inflight_joins: u64,
+    demand_starts: u64,
+    prefetch_starts: u64,
+    downloads_completed: u64,
+    downloads_failed: u64,
+    downloads_cancelled: u64,
+    downloads_bytes: u64,
+    download_millis: u64,
+    evicted: u64,
+    last_report: Instant,
 }
 impl State {
     fn limits(&self) -> (f64, f64) {
@@ -187,14 +198,23 @@ impl State {
             .filter(|e| self.retained(e))
             .map(SegmentKey::from)
             .collect();
+        let mut removed = 0u64;
+        let mut interrupted = 0u64;
         self.entries.retain(|key, download| {
             if keep.contains(key) {
                 true
             } else {
+                removed += 1;
+                if !download.body.lock().unwrap().finished {
+                    interrupted += 1;
+                }
                 download.cancel();
+                log::debug!("oxideav-hls: cache evicted segment entry");
                 false
             }
         });
+        self.evicted += removed;
+        self.downloads_cancelled += interrupted;
     }
     /// One priority rule: current, nearest future first, nearest history first.
     fn next(&mut self) -> Option<(SegmentEntry, Arc<Download>)> {
@@ -220,10 +240,43 @@ impl State {
             let entry = entry.clone();
             let download = Arc::new(Download::new());
             self.entries.insert(key, Arc::clone(&download));
+            self.prefetch_starts += 1;
             return Some((entry, download));
         }
         None
     }
+    /// Routine production statistics, emitted on a window change and at most
+    /// once every 30 seconds while the download worker is active or idle.
+    fn report(&mut self, force: bool) {
+        if !force && self.last_report.elapsed() < Duration::from_secs(30) {
+            return;
+        }
+        self.last_report = Instant::now();
+        let (entries, bytes, behind, ahead) = self.summary();
+        let complete = self
+            .entries
+            .values()
+            .filter(|entry| entry.completed())
+            .count();
+        let downloading = self
+            .entries
+            .values()
+            .filter(|entry| !entry.body.lock().unwrap().finished)
+            .count();
+        let mean_ms = self
+            .download_millis
+            .checked_div(self.downloads_completed)
+            .unwrap_or(0);
+        log::info!(
+            "oxideav-hls: cache stats center={:.1}s entries={entries} complete={complete} downloading={downloading} bytes={bytes} behind={behind:.1}s ahead={ahead:.1}s hits={} completed_hits={} inflight_joins={} misses={} demand={} prefetch={} fetched={} downloaded_bytes={} avg_download_ms={mean_ms} failed={} cancelled={} evicted={}",
+            self.segments[self.center].start_seconds,
+            self.hits, self.completed_hits, self.inflight_joins, self.misses,
+            self.demand_starts, self.prefetch_starts, self.downloads_completed,
+            self.downloads_bytes, self.downloads_failed, self.downloads_cancelled,
+            self.evicted,
+        );
+    }
+
     fn summary(&self) -> (usize, usize, f64, f64) {
         let bytes = self
             .entries
@@ -275,6 +328,17 @@ impl SegmentCache {
             stopped: false,
             hits: 0,
             misses: 0,
+            completed_hits: 0,
+            inflight_joins: 0,
+            demand_starts: 0,
+            prefetch_starts: 0,
+            downloads_completed: 0,
+            downloads_failed: 0,
+            downloads_cancelled: 0,
+            downloads_bytes: 0,
+            download_millis: 0,
+            evicted: 0,
+            last_report: Instant::now(),
         }));
         let (wake, rx) = mpsc::channel();
         let worker_state = Arc::clone(&state);
@@ -301,9 +365,15 @@ impl SegmentCache {
                 .cloned()
             {
                 state.hits += 1;
+                if existing.completed() {
+                    state.completed_hits += 1;
+                } else {
+                    state.inflight_joins += 1;
+                }
                 (existing, false)
             } else {
                 state.misses += 1;
+                state.demand_starts += 1;
                 let d = Arc::new(Download::new());
                 state.entries.insert(key, Arc::clone(&d));
                 (d, true)
@@ -313,9 +383,10 @@ impl SegmentCache {
             let entry = segment.clone();
             let d = Arc::clone(&download);
             let fetch = Arc::clone(&self.fetch);
+            let state = Arc::clone(&self.state);
             if let Err(err) = thread::Builder::new()
                 .name("oxideav-hls-demand".into())
-                .spawn(move || perform_fetch(&entry, &d, &fetch))
+                .spawn(move || perform_fetch(&entry, &d, &fetch, &state, "demand"))
             {
                 download.finish(Err(Error::other(format!("start HLS download: {err}"))));
             }
@@ -336,20 +407,25 @@ impl SegmentCache {
         state.segments = segments.to_vec();
         state.center = current;
         state.prune();
-        let (count, bytes, behind, ahead) = state.summary();
-        log::info!(
-            "oxideav-hls: cache window center={:.3}s segments={count} bytes={bytes} behind={behind:.1}s ahead={ahead:.1}s hits={} misses={}",
-            state.segments[current].start_seconds, state.hits, state.misses
-        );
+        state.report(true);
         drop(state);
         let _ = self.wake.send(());
     }
     pub(super) fn stop(&self) {
         let mut state = self.state.lock().unwrap();
+        if state.stopped {
+            return;
+        }
         state.stopped = true;
+        let mut interrupted = 0;
         for entry in state.entries.values() {
+            if !entry.body.lock().unwrap().finished {
+                interrupted += 1;
+            }
             entry.cancel();
         }
+        state.downloads_cancelled += interrupted;
+        state.report(true);
         drop(state);
         let _ = self.wake.send(());
     }
@@ -360,31 +436,64 @@ fn fetch_segment(
     emit: &dyn Fn(&[u8]) -> Result<()>,
 ) -> Result<()> {
     // Segment bytes enter the cache regardless of who requested them.
-    let bytes = oxideav_http::open_http(segment.url.as_str())?;
-    let mut input = windowed_reader(bytes, segment.range)?;
-    let mut buf = [0u8; 65536];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(Error::cancelled("HLS download cancelled"));
-        }
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-            return Ok(());
-        }
-        emit(&buf[..n])?;
-    }
+    // The underlying HTTP future is dropped promptly on cancellation even
+    // when headers or the next network chunk are stalled.
+    oxideav_http::fetch_stream_cancellable(
+        segment.url.as_str(),
+        MAX_SEGMENT_BYTES as u64,
+        segment.range.map(|range| (range.offset, range.length)),
+        cancel,
+        emit,
+    )
 }
-fn perform_fetch(segment: &SegmentEntry, download: &Arc<Download>, fetch: &Fetcher) {
+fn perform_fetch(
+    segment: &SegmentEntry,
+    download: &Arc<Download>,
+    fetch: &Fetcher,
+    state: &Arc<Mutex<State>>,
+    source: &str,
+) {
+    let started = Instant::now();
+    log::debug!(
+        "oxideav-hls: cache download started source={source} media={:.3}s",
+        segment.start_seconds
+    );
     let result = fetch(segment, &download.cancellation, &|bytes| {
         download.append(bytes)
     });
-    if let Err(ref err) = result {
-        log::warn!(
-            "oxideav-hls: download failed segment={:.3}s: {err}",
-            segment.start_seconds
-        );
+    let cancelled = download.cancellation.is_cancelled()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is_cancelled());
+    let size = download.body.lock().unwrap().bytes.len();
+    let elapsed = started.elapsed();
+    if cancelled {
+        log::debug!("oxideav-hls: cache download cancelled source={source} media={:.3}s after={elapsed:?} bytes={size}", segment.start_seconds);
+    } else if let Err(ref error) = result {
+        log::warn!("oxideav-hls: cache download failed source={source} media={:.3}s after={elapsed:?} bytes={size}: {error}", segment.start_seconds);
+    } else {
+        log::debug!("oxideav-hls: cache download complete source={source} media={:.3}s after={elapsed:?} bytes={size}", segment.start_seconds);
     }
+    let success = !cancelled && result.is_ok();
     download.finish(result);
+    let mut stats = state.lock().unwrap();
+    // Only account once for the current resident entry. An evicted, cancelled
+    // transfer has already been counted when its window was discarded.
+    let current = stats
+        .entries
+        .get(&SegmentKey::from(segment))
+        .is_some_and(|entry| Arc::ptr_eq(entry, download));
+    if current {
+        if success {
+            stats.downloads_completed += 1;
+            stats.downloads_bytes += size as u64;
+            stats.download_millis += elapsed.as_millis() as u64;
+        } else if !cancelled {
+            stats.downloads_failed += 1;
+        }
+    }
+    stats.report(false);
 }
 fn worker(shared: Arc<Mutex<State>>, wake: mpsc::Receiver<()>, fetch: Fetcher) {
     loop {
@@ -397,8 +506,9 @@ fn worker(shared: Arc<Mutex<State>>, wake: mpsc::Receiver<()>, fetch: Fetcher) {
             state.next()
         };
         if let Some((segment, download)) = task {
-            perform_fetch(&segment, &download, &fetch);
+            perform_fetch(&segment, &download, &fetch, &shared, "prefetch");
         } else {
+            shared.lock().unwrap().report(false);
             if wake
                 .recv_timeout(Duration::from_millis(250))
                 .is_err_and(|err| matches!(err, mpsc::RecvTimeoutError::Disconnected))
@@ -564,5 +674,65 @@ mod tests {
         wait(&cache, 5);
         assert!(!cache.completed(&all[0]));
         cache.stop();
+    }
+    #[test]
+    fn real_http_stalled_segment_closes_promptly_on_cache_stop() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = origin.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut conn, _) = origin.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            while !header.ends_with(b"\r\n\r\n") {
+                conn.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            conn.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: keep-alive\r\n\r\nhello",
+            )
+            .unwrap();
+            conn.flush().unwrap();
+            match conn.read(&mut byte) {
+                Ok(0) => true,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    true
+                }
+                _ => false,
+            }
+        });
+        let entries = vec![SegmentEntry {
+            url: Url::parse(&format!("http://{endpoint}/0.ts")).unwrap(),
+            range: None,
+            map: None,
+            start_seconds: 0.0,
+            duration_seconds: 10.0,
+        }];
+        let cache = SegmentCache::new(&entries, HlsCacheConfig::default());
+        let mut reader = cache.reader(&entries[0]);
+        let mut prefix = [0u8; 5];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"hello");
+        let start = Instant::now();
+        cache.stop();
+        assert!(reader.read(&mut [0u8; 1]).is_err());
+        assert!(
+            server.join().unwrap(),
+            "stalled HTTP segment stayed connected"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cache HTTP cancellation was slow"
+        );
     }
 }
