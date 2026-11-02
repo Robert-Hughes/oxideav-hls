@@ -18,9 +18,11 @@
 //! sequence numbers prevent duplicate delivery across sliding playlists.
 //! `#EXTINF` durations index available media for segment-based seeking.
 
+mod cache;
 #[cfg(test)]
 mod http_tests;
 mod packed_audio;
+pub use cache::HlsCacheConfig;
 mod segment;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -172,10 +174,15 @@ pub fn register(ctx: &mut RuntimeContext) {
 oxideav_core::register!("source", register);
 
 pub fn open_hls(uri: &str) -> Result<Box<dyn PacketSource>> {
+    open_hls_with_config(uri, HlsCacheConfig::default())
+}
+
+/// Open an HLS source with an independent per-instance segment-cache window.
+pub fn open_hls_with_config(uri: &str, config: HlsCacheConfig) -> Result<Box<dyn PacketSource>> {
     let playlist_url = unwrap_hls_uri(uri)?;
     let (media_url, media) = resolve_media_playlist(&playlist_url)?;
     validate_media_playlist(&media)?;
-    HlsPacketSource::open(&media_url, &media)
+    HlsPacketSource::open_with_config(&media_url, &media, config)
         .map(|source| Box::new(source) as Box<dyn PacketSource>)
 }
 
@@ -669,24 +676,57 @@ struct HlsPacketSource {
     pending: VecDeque<Packet>,
     segment_opener: SegmentOpener,
     readahead: Option<SegmentReadahead>,
+    cache: Option<cache::SegmentCache>,
     live: Option<LivePlaylist>,
 }
 
 impl HlsPacketSource {
-    fn open(media_url: &Url, media: &MediaPlaylist) -> Result<Self> {
+    fn open_with_config(
+        media_url: &Url,
+        media: &MediaPlaylist,
+        config: HlsCacheConfig,
+    ) -> Result<Self> {
         let maps = Arc::new(MapCache::default());
         let audio_timeline = packed_audio::Timeline::default();
-        Self::open_with_opener(
+        let segments = build_segment_index(media_url, media)?;
+        let cache = cache::SegmentCache::new(&segments, config);
+        let cache_for_open = cache.clone();
+        let result = Self::open_with_opener_mode(
             media_url,
             media,
-            Arc::new(move |segment| open_segment_demuxer(segment, &maps, &audio_timeline)),
-        )
+            Arc::new(move |segment| {
+                open_segment_demuxer(segment, &maps, &audio_timeline, Some(&cache_for_open))
+            }),
+            false,
+        );
+        match result {
+            Ok(mut source) => {
+                source.cache = Some(cache);
+                source.cache.as_ref().unwrap().recenter(0, &source.segments);
+                source.start_readahead();
+                Ok(source)
+            }
+            Err(error) => {
+                cache.stop();
+                Err(error)
+            }
+        }
     }
 
+    #[cfg(test)]
     fn open_with_opener(
         media_url: &Url,
         media: &MediaPlaylist,
         segment_opener: SegmentOpener,
+    ) -> Result<Self> {
+        Self::open_with_opener_mode(media_url, media, segment_opener, true)
+    }
+
+    fn open_with_opener_mode(
+        media_url: &Url,
+        media: &MediaPlaylist,
+        segment_opener: SegmentOpener,
+        prepare_successor: bool,
     ) -> Result<Self> {
         let segments = build_segment_index(media_url, media)?;
         let total_duration_seconds = segments
@@ -776,6 +816,7 @@ impl HlsPacketSource {
             pending,
             segment_opener,
             readahead: None,
+            cache: None,
             live: (!media.end_list).then(|| LivePlaylist {
                 url: media_url.clone(),
                 first_sequence: media.media_sequence,
@@ -789,7 +830,9 @@ impl HlsPacketSource {
         if source.live.is_some() {
             log::info!("oxideav-hls: growing playlist opened first_sequence={} segments={} available_duration={:.3}s target_duration={}s", media.media_sequence, source.segments.len(), source.total_duration_seconds, media.target_duration);
         }
-        source.start_readahead();
+        if prepare_successor {
+            source.start_readahead();
+        }
         Ok(source)
     }
 
@@ -901,6 +944,9 @@ impl HlsPacketSource {
                 self.live = None;
             }
             if changed {
+                if let Some(cache) = &self.cache {
+                    cache.recenter(self.current_segment, &self.segments);
+                }
                 self.start_readahead();
             }
             return Ok(());
@@ -938,10 +984,19 @@ impl HlsPacketSource {
         let segment = self.segments[index].clone();
         let expected_streams = self.streams.clone();
         let opener = Arc::clone(&self.segment_opener);
+        let cache = self.cache.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(format!("oxideav-hls-readahead-{index}"))
             .spawn(move || {
+                if let Some(cache) = &cache {
+                    // Segment bytes have one prefetch owner. Await them here
+                    // before opening a demuxer, avoiding duplicate requests.
+                    if let Err(error) = cache.wait_for_prefetch(&segment) {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
                 let result = prepare_segment(index, segment, expected_streams, opener);
                 let _ = sender.send(result);
             });
@@ -992,6 +1047,9 @@ impl HlsPacketSource {
     fn install_segment(&mut self, index: usize, demuxer: Box<dyn Demuxer>) -> Result<()> {
         let stream_map = stream_index_map(&self.streams, demuxer.streams(), index)?;
         self.current_segment = index;
+        if let Some(cache) = &self.cache {
+            cache.recenter(index, &self.segments);
+        }
         self.current = demuxer;
         self.current_stream_map = stream_map;
         self.pending.clear();
@@ -1002,6 +1060,9 @@ impl HlsPacketSource {
     fn install_prepared_segment(&mut self, prepared: PreparedSegment) -> Result<()> {
         let index = prepared.index;
         self.current_segment = index;
+        if let Some(cache) = &self.cache {
+            cache.recenter(index, &self.segments);
+        }
         self.current = prepared.demuxer;
         self.current_stream_map = prepared.stream_map;
         self.pending.clear();
@@ -1050,6 +1111,14 @@ fn prepare_segment(
         stream_map,
         first_packet,
     })
+}
+
+impl Drop for HlsPacketSource {
+    fn drop(&mut self) {
+        if let Some(cache) = &self.cache {
+            cache.stop();
+        }
+    }
 }
 
 impl PacketSource for HlsPacketSource {
@@ -1126,6 +1195,9 @@ impl PacketSource for HlsPacketSource {
         let media_seconds = (raw_seconds - self.transport_origin_seconds)
             .clamp(0.0, self.total_duration_seconds.max(0.0));
         let index = self.segment_for_media_seconds(media_seconds);
+        if let Some(cache) = &self.cache {
+            cache.recenter(index, &self.segments);
+        }
 
         log::info!(
             "oxideav-hls: seek target_raw={raw_seconds:.3}s media={media_seconds:.3}s segment={index} segment_start={:.3}s",
@@ -1283,9 +1355,16 @@ fn open_segment_demuxer(
     segment: &SegmentEntry,
     maps: &MapCache,
     audio_timeline: &packed_audio::Timeline,
+    cache: Option<&cache::SegmentCache>,
 ) -> Result<Box<dyn Demuxer>> {
-    let bytes = oxideav_http::open_http(segment.url.as_str())?;
-    let input = windowed_reader(bytes, segment.range)?;
+    let input = if let Some(reader) =
+        cache.and_then(|cache| cache::cached_segment_reader(cache, segment))
+    {
+        reader
+    } else {
+        let bytes = oxideav_http::open_http(segment.url.as_str())?;
+        windowed_reader(bytes, segment.range)?
+    };
     if let Some(map) = &segment.map {
         let init = maps.get_or_fetch(map)?;
         let combined: Box<dyn ReadSeek> = Box::new(InitAndSegment::new(init, input)?);

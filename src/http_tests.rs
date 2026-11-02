@@ -264,6 +264,49 @@ fn packed_aac_http_ranges_boundaries_wrap_and_repeated_seeks() {
 }
 
 #[test]
+fn completed_segment_cache_serves_backward_seeks_without_new_http_requests() {
+    let samples_per_segment = 3840u64;
+    let media = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:0.042666667,\n0.aac\n#EXTINF:0.042666667,\n1.aac\n#EXTINF:0.042666667,\n2.aac\n#EXT-X-ENDLIST\n";
+    let origin = Origin::new(HashMap::from([
+        ("/media.m3u8".into(), media.as_bytes().to_vec()),
+        ("/0.aac".into(), segment(0, 3, 2)),
+        ("/1.aac".into(), segment(samples_per_segment, 3, 2)),
+        ("/2.aac".into(), segment(samples_per_segment * 2, 3, 2)),
+    ]));
+    let (media_url, playlist) =
+        resolve_media_playlist(&unwrap_hls_uri(&origin.hls("/media.m3u8")).unwrap()).unwrap();
+    let mut source =
+        HlsPacketSource::open_with_config(&media_url, &playlist, HlsCacheConfig::default())
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let cache = source.cache.as_ref().unwrap();
+    while (0..3).any(|i| cache.get(&source.segments[i]).is_none()) {
+        assert!(Instant::now() < deadline, "prefetch did not complete");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let requests = origin.requests.lock().unwrap().clone();
+    for path in ["/1.aac", "/2.aac"] {
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| *request == &format!("GET {path}"))
+                .count(),
+            1,
+            "successor and cache prefetch must share a single download for {path}"
+        );
+    }
+    let previous = origin.requests.lock().unwrap().len();
+    for (target, landed) in [(3840, 3840), (0, 0), (7680, 7680), (3840, 3840)] {
+        assert_eq!(source.seek_to(0, target).unwrap(), landed);
+        assert_eq!(source.next_packet().unwrap().pts, Some(landed));
+    }
+    assert_eq!(
+        previous,
+        origin.requests.lock().unwrap().len(),
+        "cached backward/forward seeks should not issue HTTP requests"
+    );
+}
+#[test]
 fn live_playlist_reloads_sliding_window_and_finishes_at_endlist() {
     use std::time::Duration;
     let a = segment(0, 3, 2);

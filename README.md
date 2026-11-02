@@ -176,13 +176,52 @@ map switches the initialization data. The cache holds at most four maps of up
 to 8 MiB each. Segment `#EXT-X-BYTERANGE` is also
 honoured, including implicit offsets following a range on the same resource.
 
+## Time-windowed segment cache
+
+Each HLS source owns an independent in-memory cache of complete, compressed
+HLS media segments. The cache is discarded when its source is dropped or
+replaced; no process-global cache or cross-quality reuse is used.
+
+By default the cache targets **45 seconds ahead** and retains **30 seconds
+behind** the current indexed HLS segment. Boundaries use playlist segment
+start/duration values, so a whole segment that intersects the window may
+extend beyond its nominal boundary. There is no configurable global byte
+budget: high-bitrate renditions naturally occupy more memory. A separate
+128 MiB per-segment safety ceiling rejects unexpectedly large resources.
+
+A dedicated worker fetches successive complete segments independently of
+packet queue and decoder backpressure. Byte-range segments are cached using
+their selected range, not the entire containing resource. Cache keys include
+the absolute URL and optional byte range. Initialization-map caching remains
+independent.
+
+The active demuxer uses cached bytes when available. On a miss it retains
+the original streaming HTTP path, so first-frame startup and out-of-window
+seeks do not require a complete segment download. Once background prefetch
+finishes, subsequent openings and backward seeks reuse those bytes.
+The successor preparation worker waits for that cached download instead of
+launching a competing transfer. If prefetch fails, it falls back to streaming.
+
+Distant seeks cancel obsolete whole-segment downloads and move the window.
+Segments outside the new window are evicted. Dropping the source stops the
+worker without synchronously joining a stalled transfer. Whole-segment HTTP
+requests are cancellable; byte-range streaming checks cancellation between reads.
+
+Use open_hls_with_config(uri, HlsCacheConfig { backward, forward }) to set
+per-instance windows. Registered HLS sources and open_hls() use defaults.
+The cache window diagnostic logs current position, cached segments, bytes,
+coverage before and after, and hit/miss totals.
+
+Tests cover retention/eviction, distant-seek cancellation, and end-to-end
+local-HTTP backward and forward seeks without repeat network requests.
+
 ## Successor readahead
 
 Exactly one successor segment is prepared in the background.
 
 While segment N is active, a worker for segment N+1:
 
-1. opens the segment's HTTP resource;
+1. waits for the same segment cache prefetch, falling back to streaming if it fails;
 2. detects the segment format and creates its demuxer;
 3. validates that its stream layout matches the current rendition; and
 4. primes the first packet.
