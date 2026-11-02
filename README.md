@@ -209,13 +209,19 @@ but does not own a separate network download path.
 
 Distant seeks cancel entries outside the new window. Dropping the source
 cancels its entries without synchronously joining stalled network workers.
-HTTP reader cancellation is checked between blocking reads, and waiting
-cache readers are woken immediately when an entry is cancelled.
+All HLS media-segment transfers use the asynchronous cancellable streaming
+API in oxideav-http. Cancellation interrupts stalled response headers or body
+reads without waiting for blocking network I/O to return. Cached readers
+waiting for bytes are woken immediately as well.
 
 Use open_hls_with_config(uri, HlsCacheConfig { backward, forward }) to set
 per-instance windows. Registered HLS sources and open_hls() use defaults.
-The cache window diagnostic logs current position, cached segments, bytes,
-coverage before and after, and hit/miss totals.
+INFO cache statistics are logged on window changes, on shutdown and every
+30 seconds: current media position, complete/in-flight segments, bytes,
+contiguous coverage ahead and behind, completed-cache hits, in-flight joins,
+demand/prefetch starts, completed download counts and bytes, average download
+time, genuine failures, expected cancellations and evictions. Per-segment
+download events are DEBUG. Signed segment URLs are not logged by the cache.
 
 Tests cover retention/eviction, distant-seek cancellation, and end-to-end
 local-HTTP backward and forward seeks without repeat network requests.
