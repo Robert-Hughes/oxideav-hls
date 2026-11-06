@@ -52,20 +52,6 @@ impl Download {
             cancellation: CancellationToken::new(),
         }
     }
-    fn append(&self, chunk: &[u8]) -> Result<()> {
-        if self.cancellation.is_cancelled() {
-            return Err(Error::cancelled("HLS download cancelled"));
-        }
-        let mut body = self.body.lock().unwrap();
-        if body.bytes.len().saturating_add(chunk.len()) > MAX_SEGMENT_BYTES {
-            return Err(Error::unsupported(
-                "HLS segment exceeds 128 MiB safety ceiling",
-            ));
-        }
-        body.bytes.extend_from_slice(chunk);
-        self.ready.notify_all();
-        Ok(())
-    }
     fn finish(&self, outcome: Result<()>) {
         let mut body = self.body.lock().unwrap();
         body.error = outcome.err().map(|error| error.to_string());
@@ -446,6 +432,103 @@ fn fetch_segment(
         emit,
     )
 }
+/// Re-fetch complete segments and compare their already-published prefix before
+/// appending new data. Unlike an unchecked HTTP Range resume, replay verification
+/// protects against a CDN changing bytes when no strong validator is provided.
+/// Bounded retries preserve readers of partially downloaded cache entries.
+fn fetch_with_retries(
+    segment: &SegmentEntry,
+    download: &Arc<Download>,
+    fetch: &Fetcher,
+) -> Result<()> {
+    const BACKOFFS: [Duration; 2] = [Duration::from_millis(100), Duration::from_millis(300)];
+    for attempt in 0..=BACKOFFS.len() {
+        if download.cancellation.is_cancelled() {
+            return Err(Error::cancelled("HLS segment download cancelled"));
+        }
+        let replay_offset = Mutex::new(0usize);
+        let changed = std::sync::atomic::AtomicBool::new(false);
+        let result = fetch(segment, &download.cancellation, &|chunk| {
+            if download.cancellation.is_cancelled() {
+                return Err(Error::cancelled("HLS segment download cancelled"));
+            }
+            let mut offset = replay_offset.lock().unwrap();
+            let mut body = download.body.lock().unwrap();
+            let overlap = chunk.len().min(body.bytes.len().saturating_sub(*offset));
+            if body.bytes[*offset..*offset + overlap] != chunk[..overlap] {
+                changed.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(Error::invalid(
+                    "HLS segment changed across retries: prefix mismatch",
+                ));
+            }
+            let fresh = &chunk[overlap..];
+            if !fresh.is_empty() {
+                if body.bytes.len().saturating_add(fresh.len()) > MAX_SEGMENT_BYTES {
+                    return Err(Error::unsupported(
+                        "HLS segment exceeds 128 MiB safety ceiling",
+                    ));
+                }
+                body.bytes.extend_from_slice(fresh);
+                download.ready.notify_all();
+            }
+            *offset += chunk.len();
+            Ok(())
+        });
+        if download.cancellation.is_cancelled() {
+            return Err(Error::cancelled("HLS segment download cancelled"));
+        }
+        // A successful but shorter replay would abandon bytes already delivered
+        // to consumers, and must therefore be treated as a changed segment.
+        if result.is_ok()
+            && *replay_offset.lock().unwrap() < download.body.lock().unwrap().bytes.len()
+        {
+            return Err(Error::invalid(
+                "HLS segment changed across retries: shorter replay",
+            ));
+        }
+        match result {
+            Ok(()) => {
+                if attempt > 0 {
+                    log::info!("oxideav-hls: segment recovered after {attempt} retries media={:.3}s bytes={}",
+                        segment.start_seconds, download.body.lock().unwrap().bytes.len());
+                }
+                return Ok(());
+            }
+            Err(error) if error.is_cancelled() => return Err(error),
+            Err(error) if changed.load(std::sync::atomic::Ordering::Relaxed) => return Err(error),
+            Err(error) if attempt == BACKOFFS.len() => {
+                return Err(Error::other(format!(
+                    "HLS segment failed after {} attempts media={:.3}s cached_bytes={}: {error}",
+                    attempt + 1,
+                    segment.start_seconds,
+                    download.body.lock().unwrap().bytes.len()
+                )));
+            }
+            Err(error) => {
+                log::warn!(
+                    "oxideav-hls: segment retry {}/{} media={:.3}s cached_bytes={} cause={error}",
+                    attempt + 1,
+                    BACKOFFS.len(),
+                    segment.start_seconds,
+                    download.body.lock().unwrap().bytes.len()
+                );
+            }
+        }
+        // Short, cancellable backoff: a seek must not wait for retries on an
+        // obsolete segment.
+        let until = Instant::now() + BACKOFFS[attempt];
+        loop {
+            if download.cancellation.is_cancelled() {
+                return Err(Error::cancelled("HLS segment download cancelled"));
+            }
+            let Some(remaining) = until.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+    unreachable!()
+}
 fn perform_fetch(
     segment: &SegmentEntry,
     download: &Arc<Download>,
@@ -458,9 +541,7 @@ fn perform_fetch(
         "oxideav-hls: cache download started source={source} media={:.3}s",
         segment.start_seconds
     );
-    let result = fetch(segment, &download.cancellation, &|bytes| {
-        download.append(bytes)
-    });
+    let result = fetch_with_retries(segment, download, fetch);
     let cancelled = download.cancellation.is_cancelled()
         || result
             .as_ref()
@@ -675,6 +756,144 @@ mod tests {
         assert!(!cache.completed(&all[0]));
         cache.stop();
     }
+    #[test]
+    fn interrupted_segment_resumes_without_duplicate_bytes_for_two_readers() {
+        let all = segments(1);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let fetch: Fetcher = Arc::new(move |_, _, emit| {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                emit(b"hello")?;
+                return Err(Error::other("connection dropped"));
+            }
+            emit(b"hel")?;
+            emit(b"lo world")
+        });
+        let cache = SegmentCache::with_fetcher(&all, HlsCacheConfig::default(), fetch);
+        let mut first = cache.reader(&all[0]);
+        let mut second = cache.reader(&all[0]);
+        let mut prefix = [0u8; 5];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"hello");
+        wait(&cache, 1);
+        let mut all_bytes = Vec::new();
+        first.seek(SeekFrom::Start(0)).unwrap();
+        first.read_to_end(&mut all_bytes).unwrap();
+        assert_eq!(all_bytes, b"hello world");
+        all_bytes.clear();
+        second.read_to_end(&mut all_bytes).unwrap();
+        assert_eq!(all_bytes, b"hello world");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        cache.stop();
+    }
+
+    #[test]
+    fn changed_segment_on_retry_fails_without_appending_corrupt_bytes() {
+        let entry = segments(1).remove(0);
+        let download = Arc::new(Download::new());
+        let attempts = AtomicUsize::new(0);
+        let fetch: Fetcher = Arc::new(move |_, _, emit| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                emit(b"prefix")?;
+                Err(Error::other("short HTTP response"))
+            } else {
+                emit(b"prEfix_changed")
+            }
+        });
+        let error = fetch_with_retries(&entry, &download, &fetch).unwrap_err();
+        assert!(error.to_string().contains("prefix mismatch"), "{error}");
+        assert_eq!(download.body.lock().unwrap().bytes, b"prefix");
+    }
+
+    #[test]
+    fn repeated_segment_errors_exhaust_bounded_budget_without_byte_duplication() {
+        let entry = segments(1).remove(0);
+        let download = Arc::new(Download::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let fetch: Fetcher = Arc::new(move |_, _, emit| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            emit(b"partial")?;
+            Err(Error::other("transient transport EOF"))
+        });
+        let error = fetch_with_retries(&entry, &download, &fetch).unwrap_err();
+        assert!(error.to_string().contains("after 3 attempts"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(download.body.lock().unwrap().bytes, b"partial");
+    }
+
+    #[test]
+    fn cancellation_during_retry_backoff_skips_further_http_attempts() {
+        let entry = segments(1).remove(0);
+        let download = Arc::new(Download::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let fetch: Fetcher = Arc::new(move |_, _, emit| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            emit(b"first")?;
+            Err(Error::other("connection closed"))
+        });
+        let cancel = Arc::clone(&download);
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            cancel.cancel();
+        });
+        let error = fetch_with_retries(&entry, &download, &fetch).unwrap_err();
+        stopper.join().unwrap();
+        assert!(error.is_cancelled(), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn real_http_truncated_byterange_is_retried_with_verified_prefix() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&request).contains("bytes=4-9"),
+                    "byte range must be preserved across retries"
+                );
+                let header = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-9/20\r\nContent-Length: 6\r\nConnection: close\r\n\r\n";
+                socket.write_all(header).unwrap();
+                socket
+                    .write_all(if attempt == 0 { b"abc" } else { b"abcdef" })
+                    .unwrap();
+            }
+        });
+        let entry = SegmentEntry {
+            url: Url::parse(&format!("http://{addr}/segment.ts")).unwrap(),
+            range: Some(ByteWindowSpec {
+                offset: 4,
+                length: 6,
+            }),
+            map: None,
+            start_seconds: 0.0,
+            duration_seconds: 10.0,
+        };
+        let cache = SegmentCache::new(std::slice::from_ref(&entry), HlsCacheConfig::default());
+        let mut reader = cache.reader(&entry);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcdef");
+        server.join().unwrap();
+        cache.stop();
+    }
+
     #[test]
     fn real_http_stalled_segment_closes_promptly_on_cache_stop() {
         use std::io::{Read as _, Write as _};
